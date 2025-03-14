@@ -13,9 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-serdes_lib = library('serdes',
-           'serdes.cpp', 'serdes.h',
-           include_directories: nixl_inc_dirs,
+pybind_dep = dependency('pybind11')
+
+nixl_dep = declare_dependency(link_with: nixl_lib, include_directories: nixl_inc_dirs)
+
+py = import('python').find_installation('python3', pure: false)
+
+py.extension_module('_bindings',
+           'nixl_bindings.cpp',
+           subdir: ('nixl'),
+           dependencies: [nixl_dep, serdes_interface, pybind_dep],
+           include_directories: [nixl_inc_dirs, utils_inc_dirs],
            install: true)
 
-serdes_interface = declare_dependency(link_with: serdes_lib)
+py.extension_module('_utils',
+           'nixl_utils.cpp',
+           subdir: ('nixl'),
+           dependencies: [pybind_dep],
+           install: true)

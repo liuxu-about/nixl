@@ -13,9 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-serdes_lib = library('serdes',
-           'serdes.cpp', 'serdes.h',
-           include_directories: nixl_inc_dirs,
-           install: true)
+nixl_build_lib = library('nixl_build',
+                        'nixl_descriptors.cpp',
+                        'nixl_memory_section.cpp',
+                        include_directories: [ nixl_inc_dirs, utils_inc_dirs ],
+                        dependencies: [serdes_interface],
+                        install: true)
 
-serdes_interface = declare_dependency(link_with: serdes_lib)
+nixl_infra = declare_dependency(link_with: nixl_build_lib)

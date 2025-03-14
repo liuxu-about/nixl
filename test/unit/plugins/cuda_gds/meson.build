@@ -13,9 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-serdes_lib = library('serdes',
-           'serdes.cpp', 'serdes.h',
-           include_directories: nixl_inc_dirs,
-           install: true)
+if cuda_dep.found()
+    cuda_dependencies = [cuda_dep]
+    cpp_args = '-DUSE_VRAM'
+else
+    cuda_dependencies = []
+    cpp_args = '-UUSE_VRAM'
+endif
 
-serdes_interface = declare_dependency(link_with: serdes_lib)
+nixl_gds_app = executable('nixl_gds_test', 'nixl_gds_test.cpp',
+                          dependencies: [nixl_dep, nixl_infra, cuda_dep],
+                          include_directories: [nixl_inc_dirs, utils_inc_dirs],
+                          install: true)

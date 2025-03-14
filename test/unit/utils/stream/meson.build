@@ -13,9 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-serdes_lib = library('serdes',
-           'serdes.cpp', 'serdes.h',
-           include_directories: nixl_inc_dirs,
-           install: true)
-
-serdes_interface = declare_dependency(link_with: serdes_lib)
+md_streamer = executable('md_streamer',
+            'metadata_streamer.cpp',
+            dependencies: [nixl_dep, nixl_infra, stream_interface],
+            include_directories: [nixl_inc_dirs, utils_inc_dirs],
+            install: true)

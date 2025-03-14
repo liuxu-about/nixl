@@ -1,3 +1,4 @@
+
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -13,9 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-serdes_lib = library('serdes',
-           'serdes.cpp', 'serdes.h',
-           include_directories: nixl_inc_dirs,
-           install: true)
+subdir('ucx')
 
-serdes_interface = declare_dependency(link_with: serdes_lib)
+disable_gds_backend = get_option('disable_gds_backend')
+if not disable_gds_backend
+    subdir('cuda_gds')
+endif

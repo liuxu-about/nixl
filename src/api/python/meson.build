@@ -13,9 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-serdes_lib = library('serdes',
-           'serdes.cpp', 'serdes.h',
-           include_directories: nixl_inc_dirs,
-           install: true)
+py = import('python').find_installation('python3', pure: false)
 
-serdes_interface = declare_dependency(link_with: serdes_lib)
+py.install_sources('_api.py', subdir: ('nixl'))
+py.install_sources('__init__.py', subdir: ('nixl'))
