@@ -13,18 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ucx_utils_dep = [ ucx_dep, nixl_common_dep, serdes_interface ]
+# Device API test utilities and sources
+device_api_inc_dirs = include_directories('.')
 
-if cuda_dep.found()
-    ucx_utils_dep += [ cuda_dep ]
-endif
+device_api_sources = [
+    'single_write_test.cu',
+    'utils.cu'
+]
 
-ucx_utils_inc_dirs = include_directories('.')
-
-ucx_utils_sources = ['ucx_utils.cpp', 'ucx_utils.h', 'config.h', 'config.cpp', 'rkey.cpp', 'rkey.h', 'device_mem_list.cpp', 'device_mem_list.h']
-
-ucx_utils_lib = library('ucx_utils',
-           ucx_utils_sources,
-           dependencies: ucx_utils_dep,
-           include_directories: [ nixl_inc_dirs, utils_inc_dirs ],
-           install: true)
+# Export for parent meson.build
+device_api_test_sources = files(device_api_sources)
