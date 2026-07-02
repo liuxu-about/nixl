@@ -32,6 +32,54 @@ extern "C" {
 #include "absl/strings/numbers.h"
 
 inline constexpr std::string_view nixl_ucx_err_handling_param_name = "ucx_error_handling_mode";
+inline constexpr std::string_view nixl_ucx_vram_staging_param_name = "vram_staging";
+inline constexpr std::string_view nixl_ucx_staging_chunk_size_param_name = "staging_chunk_size";
+inline constexpr std::string_view nixl_ucx_staging_slots_param_name = "staging_slots_per_gpu";
+inline constexpr std::string_view nixl_ucx_staging_force_progress_param_name =
+    "staging_force_progress_thread";
+inline constexpr std::string_view nixl_ucx_staging_cuda_streams_param_name =
+    "staging_cuda_copy_streams";
+inline constexpr std::string_view nixl_ucx_staging_slot_window_param_name =
+    "staging_slot_request_window";
+inline constexpr std::string_view nixl_ucx_staging_batch_flush_param_name =
+    "staging_batch_flush";
+inline constexpr std::string_view nixl_ucx_staging_target_h2d_worker_param_name =
+    "staging_target_h2d_worker";
+inline constexpr std::string_view nixl_ucx_staging_source_d2h_prefetch_param_name =
+    "staging_source_d2h_prefetch";
+inline constexpr std::string_view nixl_ucx_staging_lease_timeout_param_name =
+    "staging_lease_timeout_ms";
+inline constexpr std::string_view nixl_ucx_vram_local_staging_param_name = "vram_local_staging";
+inline constexpr std::string_view nixl_ucx_local_staging_shm_dir_param_name =
+    "local_staging_shm_dir";
+inline constexpr std::string_view nixl_ucx_local_staging_fallback_param_name =
+    "local_staging_fallback";
+inline constexpr std::string_view nixl_ucx_vram_staging_env_name = "NIXL_UCX_VRAM_STAGING";
+inline constexpr std::string_view nixl_ucx_staging_chunk_size_env_name =
+    "NIXL_UCX_STAGING_CHUNK_SIZE";
+inline constexpr std::string_view nixl_ucx_staging_slots_env_name = "NIXL_UCX_STAGING_SLOTS";
+inline constexpr std::string_view nixl_ucx_staging_force_progress_env_name =
+    "NIXL_UCX_STAGING_FORCE_PROGRESS_THREAD";
+inline constexpr std::string_view nixl_ucx_staging_cuda_streams_env_name =
+    "NIXL_UCX_STAGING_CUDA_COPY_STREAMS";
+inline constexpr std::string_view nixl_ucx_staging_slot_window_env_name =
+    "NIXL_UCX_STAGING_SLOT_REQUEST_WINDOW";
+inline constexpr std::string_view nixl_ucx_staging_batch_flush_env_name =
+    "NIXL_UCX_STAGING_BATCH_FLUSH";
+inline constexpr std::string_view nixl_ucx_staging_target_h2d_worker_env_name =
+    "NIXL_UCX_STAGING_TARGET_H2D_WORKER";
+inline constexpr std::string_view nixl_ucx_staging_source_d2h_prefetch_env_name =
+    "NIXL_UCX_STAGING_SOURCE_D2H_PREFETCH";
+inline constexpr std::string_view nixl_ucx_staging_lease_timeout_env_name =
+    "NIXL_UCX_STAGING_LEASE_TIMEOUT_MS";
+inline constexpr std::string_view nixl_ucx_vram_local_staging_env_name =
+    "NIXL_UCX_VRAM_LOCAL_STAGING";
+inline constexpr std::string_view nixl_ucx_local_staging_shm_dir_env_name =
+    "NIXL_UCX_LOCAL_STAGING_SHM_DIR";
+inline constexpr std::string_view nixl_ucx_local_staging_fallback_env_name =
+    "NIXL_UCX_LOCAL_STAGING_FALLBACK";
+inline constexpr std::string_view nixl_ucx_local_staging_force_attach_fail_env_name =
+    "NIXL_UCX_LOCAL_STAGING_FORCE_ATTACH_FAIL";
 
 // The API `ucp_context_query(ctx, &attr)` sets `UCS_MEMORY_TYPE_RDMA` in `attr.memory_types`
 // field only from UCX 1.22
@@ -54,6 +102,22 @@ nixl_b_params_get(const nixl_b_params_t *custom_params, const std::string &key, 
         return absl::SimpleAtoi(it->second, &result) ? result : default_value;
     }
 }
+
+[[nodiscard]] bool
+nixl_b_params_get_bool(const nixl_b_params_t *custom_params,
+                       std::string_view key,
+                       bool default_value);
+
+[[nodiscard]] size_t
+nixl_b_params_get_size(const nixl_b_params_t *custom_params,
+                       std::string_view key,
+                       size_t default_value);
+
+[[nodiscard]] bool
+nixl_env_get_bool(std::string_view name, bool default_value);
+
+[[nodiscard]] size_t
+nixl_env_get_size(std::string_view name, size_t default_value);
 
 using nixlUcxReq = void *;
 

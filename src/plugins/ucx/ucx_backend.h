@@ -22,12 +22,15 @@
 #include <iostream>
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
 #include <memory>
 #include <condition_variable>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <poll.h>
 #include <optional>
+#include <unordered_map>
 
 #include "nixl.h"
 
@@ -208,6 +211,40 @@ public:
     void releaseMemView(nixlMemViewH) const override;
 
 protected:
+    struct VramStagingConfig {
+        bool enabled = false;
+        size_t chunkSize = 16 * 1024 * 1024;
+        size_t slotsPerGpu = 4;
+        bool forceProgressThread = true;
+        size_t cudaCopyStreams = 1;
+        size_t slotRequestWindow = 0;
+        bool batchFlush = false;
+        bool targetH2DWorker = false;
+        bool sourceD2HPrefetch = false;
+        // Reclaim REMOTE_RESERVED leases older than this when no free slot is left
+        // (dead-initiator backstop). 0 disables reclaim. The budget must cover the
+        // whole grant -> READY span (local slot wait, D2H, RDMA, flush), all driven
+        // by application polling. The initiator refuses to use a grant once half of
+        // this budget has elapsed since its SLOT_REQ was posted (stale-grant guard),
+        // so the remaining half must cover the worst-case post-write RDMA + flush +
+        // READY span.
+        size_t leaseTimeoutMs = 60000;
+        bool localStaging = false;
+        bool localStagingAutoEnabled = false;
+        bool localStagingFallback = true;
+        std::string localStagingShmDir = "/dev/shm/nixl";
+    };
+
+    [[nodiscard]] bool
+    vramStagingEnabled() const noexcept {
+        return vramStagingConfig_.enabled;
+    }
+
+    [[nodiscard]] const VramStagingConfig &
+    vramStagingConfig() const noexcept {
+        return vramStagingConfig_;
+    }
+
     const std::vector<std::unique_ptr<nixlUcxWorker>> &
     getWorkers() const {
         return uws;
@@ -217,6 +254,9 @@ protected:
     getWorker(size_t worker_id) const {
         return uws[worker_id];
     }
+
+    void
+    stopStagedH2DWorker();
 
     [[nodiscard]] size_t
     getWorkerId(const nixl_opt_b_args_t *opt_args = nullptr) const noexcept;
@@ -246,6 +286,262 @@ private:
     // Memory management helpers
     nixl_status_t
     internalMDHelper(const nixl_blob_t &blob, const std::string &agent, nixlBackendMD *&output);
+
+    nixl_status_t
+    internalStagedMDHelper(const nixl_blob_t &blob,
+                           const std::string &agent,
+                           nixlBackendMD *&output);
+
+    uint64_t
+    nextStagedTransferId() const noexcept;
+
+    nixl_status_t
+    registerPendingStagedReq(uint64_t transfer_id, nixlBackendReqH *handle) const;
+
+    void
+    unregisterPendingStagedReq(uint64_t transfer_id, nixlBackendReqH *handle) const;
+
+    void
+    completePendingStagedSlotGrant(const std::string &remote_agent,
+                                   uint64_t transfer_id,
+                                   uint64_t chunk_id,
+                                   uint64_t slot_id,
+                                   uint64_t lease_id,
+                                   nixl_status_t status) const;
+
+    void
+    completePendingStagedReq(uint64_t transfer_id,
+                             uint64_t chunk_id,
+                             uint64_t lease_id,
+                             nixl_status_t status) const;
+
+    void
+    registerStagedRegion(nixlBackendMD *metadata);
+
+    nixl_status_t
+    postStagedWrite(const nixl_meta_dlist_t &local,
+                    const nixl_meta_dlist_t &remote,
+                    const std::string &remote_agent,
+                    nixlBackendReqH *handle,
+                    const nixl_opt_b_args_t *opt_args) const;
+
+    nixl_status_t
+    checkStagedXfer(nixlBackendReqH *handle) const;
+
+    nixl_status_t
+    sendStagedSlotReq(const std::string &remote_agent,
+                      uint64_t transfer_id,
+                      uint64_t chunk_id,
+                      uintptr_t remote_gpu_addr,
+                      uint64_t remote_gpu_dev,
+                      size_t size,
+                      const std::unique_ptr<nixlUcxEp> &ep,
+                      nixlUcxReq *req) const;
+
+    nixl_status_t
+    sendStagedSlotGrant(const std::string &remote_agent,
+                        uint64_t transfer_id,
+                        uint64_t chunk_id,
+                        uint64_t slot_id,
+                        uint64_t lease_id,
+                        nixl_status_t status,
+                        ucp_ep_h reply_ep = nullptr) const;
+
+    nixl_status_t
+    sendStagedControlAm(const std::string &remote_agent,
+                        ucp_ep_h reply_ep,
+                        nixl::ucx::am_cb_op_t msg_id,
+                        std::string *buffer) const;
+
+    nixl_status_t
+    sendStagedSlotRelease(const std::string &remote_agent,
+                          uint64_t transfer_id,
+                          uint64_t chunk_id,
+                          uint64_t slot_id,
+                          uint64_t lease_id,
+                          uintptr_t remote_gpu_addr,
+                          uint64_t remote_gpu_dev,
+                          size_t size) const;
+
+    nixl_status_t
+    sendStagedWriteReady(const std::string &remote_agent,
+                         uint64_t transfer_id,
+                         uint64_t chunk_id,
+                         uint64_t remote_slot_id,
+                         uint64_t lease_id,
+                         uintptr_t remote_gpu_addr,
+                         uint64_t remote_gpu_dev,
+                         size_t size,
+                         const std::unique_ptr<nixlUcxEp> &ep,
+                         nixlUcxReq *req) const;
+
+    nixl_status_t
+    sendStagedLocalWriteReady(const std::string &remote_agent,
+                              uint64_t transfer_id,
+                              uint64_t chunk_id,
+                              uint64_t source_region_id,
+                              const std::string &source_region_cookie,
+                              uint64_t source_slot_id,
+                              uint64_t source_slot_generation,
+                              const std::string &source_shared_path,
+                              size_t source_slot_offset,
+                              size_t source_mapping_size,
+                              uintptr_t remote_gpu_addr,
+                              uint64_t remote_gpu_dev,
+                              size_t size,
+                              const std::unique_ptr<nixlUcxEp> &ep,
+                              nixlUcxReq *req) const;
+
+    nixl_status_t
+    sendStagedAck(const std::string &remote_agent,
+                  uint64_t transfer_id,
+                  uint64_t chunk_id,
+                  uint64_t lease_id,
+                  nixl_status_t status,
+                  ucp_ep_h reply_ep = nullptr) const;
+
+    nixl_status_t
+    handleStagedSlotReq(const nixl_blob_t &message, ucp_ep_h reply_ep = nullptr) const;
+
+    nixl_status_t
+    handleStagedSlotRelease(const nixl_blob_t &message) const;
+
+    nixl_status_t
+    handleStagedWriteReady(const nixl_blob_t &message, ucp_ep_h reply_ep = nullptr) const;
+
+    nixl_status_t
+    handleStagedLocalWriteReady(const nixl_blob_t &message, ucp_ep_h reply_ep = nullptr) const;
+
+    struct StagedH2DTask {
+        nixlBackendMD *region = nullptr;
+        void *hostAddr = nullptr;
+        std::string remoteAgent;
+        ucp_ep_h replyEp = nullptr;
+        uint64_t transferId = 0;
+        uint64_t chunkId = 0;
+        uint64_t slotId = 0;
+        uint64_t leaseId = 0;
+        uintptr_t gpuAddr = 0;
+        uint64_t gpuDev = 0;
+        size_t size = 0;
+        bool profileEnabled = false;
+        uint64_t callbackUs = 0;
+    };
+
+    struct LocalSharedAttachment {
+        std::string path;
+        std::string remoteAgent;
+        void *base = nullptr;
+        size_t mappingSize = 0;
+        int fd = -1;
+        bool hostRegistered = false;
+    };
+
+    struct LocalSharedRegionInfo {
+        std::string remoteAgent;
+        uint64_t regionId = 0;
+        std::string regionCookie;
+        std::string sharedPath;
+        size_t mappingSize = 0;
+        size_t slotSize = 0;
+        size_t slotCount = 0;
+        size_t refCount = 0;
+    };
+
+    void
+    startStagedH2DWorker();
+
+    [[nodiscard]] nixl_status_t
+    enqueueStagedH2D(StagedH2DTask &&task) const;
+
+    void
+    stagedH2DWorkerLoop() const;
+
+    void
+    registerLocalSharedRegion(const std::string &remote_agent,
+                              const nixlBackendMD *metadata) const;
+
+    void
+    unregisterLocalSharedRegion(const nixlBackendMD *metadata) const;
+
+    [[nodiscard]] bool
+    validateLocalSharedReady(const std::string &remote_agent,
+                             uint64_t region_id,
+                             const std::string &region_cookie,
+                             const std::string &shared_path,
+                             uint64_t slot_id,
+                             size_t slot_offset,
+                             size_t mapping_size,
+                             size_t size) const;
+
+    nixl_status_t
+    getLocalSharedAttachment(const std::string &remote_agent,
+                             const std::string &path,
+                             size_t mapping_size,
+                             std::shared_ptr<LocalSharedAttachment> &attachment) const;
+
+    void
+    cleanupLocalSharedAttachments();
+
+    void
+    cleanupLocalSharedAttachmentsForAgent(const std::string &remote_agent);
+
+    void
+    cleanupLocalSharedAttachmentPath(const std::string &path) const;
+
+    static void
+    releaseLocalSharedAttachment(std::shared_ptr<LocalSharedAttachment> &attachment);
+
+    static ucs_status_t
+    stagedSlotReqAmCb(void *arg,
+                      const void *header,
+                      size_t header_length,
+                      void *data,
+                      size_t length,
+                      const ucp_am_recv_param_t *param);
+
+    static ucs_status_t
+    stagedSlotGrantAmCb(void *arg,
+                        const void *header,
+                        size_t header_length,
+                        void *data,
+                        size_t length,
+                        const ucp_am_recv_param_t *param);
+
+    static ucs_status_t
+    stagedSlotReleaseAmCb(void *arg,
+                          const void *header,
+                          size_t header_length,
+                          void *data,
+                          size_t length,
+                          const ucp_am_recv_param_t *param);
+
+    static ucs_status_t
+    stagedWriteReadyAmCb(void *arg,
+                         const void *header,
+                         size_t header_length,
+                         void *data,
+                         size_t length,
+                         const ucp_am_recv_param_t *param);
+
+    static ucs_status_t
+    stagedLocalWriteReadyAmCb(void *arg,
+                              const void *header,
+                              size_t header_length,
+                              void *data,
+                              size_t length,
+                              const ucp_am_recv_param_t *param);
+
+    static ucs_status_t
+    stagedAckAmCb(void *arg,
+                  const void *header,
+                  size_t header_length,
+                  void *data,
+                  size_t length,
+                  const ucp_am_recv_param_t *param);
+
+    static VramStagingConfig
+    makeVramStagingConfig(const nixl_b_params_t *custom_params);
 
     // Notifications
     static ucs_status_t
@@ -292,8 +588,40 @@ private:
     std::vector<std::unique_ptr<nixlUcxWorker>> uws;
     std::string workerAddr;
     mutable std::atomic<size_t> sharedWorkerIndex_;
+    VramStagingConfig vramStagingConfig_;
+    mutable std::atomic<uint64_t> nextStagedTransferId_;
+    mutable std::mutex stagedReqMutex_;
+    mutable std::unordered_map<uint64_t, nixlBackendReqH *> pendingStagedReqs_;
+    mutable std::mutex stagedRegionMutex_;
+    std::vector<nixlBackendMD *> stagedRegions_;
+    mutable std::atomic<uint64_t> stagedProfileTargetReadyCount_{0};
+    mutable std::atomic<uint64_t> stagedProfileTargetBytes_{0};
+    mutable std::atomic<uint64_t> stagedProfileTargetH2DUs_{0};
+    mutable std::atomic<uint64_t> stagedProfileTargetCallbackUs_{0};
+    mutable std::atomic<uint64_t> stagedProfileLocalReadyCount_{0};
+    mutable std::atomic<uint64_t> stagedProfileLocalErrors_{0};
+    mutable std::atomic<uint64_t> stagedProfileLocalBytes_{0};
+    mutable std::atomic<uint64_t> stagedProfileLocalH2DUs_{0};
+    mutable std::atomic<uint64_t> stagedProfileLocalCallbackUs_{0};
+    mutable std::atomic<uint64_t> localSharedAttachCacheHits_{0};
+    mutable std::atomic<uint64_t> localSharedAttachCacheMisses_{0};
+    mutable std::atomic<uint64_t> localSharedAttachFailures_{0};
+    mutable std::atomic<uint64_t> localSharedAttachUs_{0};
+    mutable std::mutex stagedH2DMutex_;
+    mutable std::condition_variable stagedH2DCv_;
+    mutable std::deque<StagedH2DTask> stagedH2DQueue_;
+    mutable bool stagedH2DStop_ = false;
+    std::thread stagedH2DThread_;
+    mutable std::mutex localSharedAttachMutex_;
+    mutable std::unordered_map<std::string, std::shared_ptr<LocalSharedAttachment>>
+        localSharedAttachments_;
+    mutable std::unordered_map<std::string, LocalSharedRegionInfo> localSharedRegions_;
 
-    // Map of agent name to saved nixlUcxConnection info
+    // Map of agent name to saved nixlUcxConnection info.
+    // Guarded by remoteConnMapMutex_: read from app threads and from staged AM
+    // callbacks on the progress thread, while SGLang-style dynamic peer setup can
+    // insert/erase concurrently.
+    mutable std::shared_mutex remoteConnMapMutex_;
     std::unordered_map<std::string, ucx_connection_ptr_t> remoteConnMap;
 };
 
