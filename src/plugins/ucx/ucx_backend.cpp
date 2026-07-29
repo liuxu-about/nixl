@@ -400,6 +400,48 @@ public:
  * Staged VRAM metadata
 *****************************************/
 
+struct nixlUcxStagedRemotePool {
+    [[nodiscard]] bool
+    tryAcquireSlotWindow() {
+        size_t in_use = windowInUse.load(std::memory_order_relaxed);
+        while (in_use < windowLimit) {
+            if (windowInUse.compare_exchange_weak(in_use,
+                                                  in_use + 1,
+                                                  std::memory_order_acq_rel,
+                                                  std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void
+    releaseSlotWindow() {
+        const size_t previous = windowInUse.fetch_sub(1, std::memory_order_acq_rel);
+        if (previous == 0) {
+            windowInUse.fetch_add(1, std::memory_order_relaxed);
+            NIXL_WARN << "UCX staged remote pool window release underflow";
+        }
+    }
+
+    std::string agent;
+    uint64_t gpuDev = 0;
+    uint64_t poolEpoch = 0;
+    uintptr_t rxBase = 0;
+    size_t slotStride = 0;
+    size_t slotSize = 0;
+    size_t rxCount = 0;
+    std::string rxRkeyBlob;
+    std::vector<nixl::ucx::rkey> rxRkeys;
+    size_t windowLimit = 0;
+    std::atomic<size_t> windowInUse{0};
+    bool localShared = false;
+    std::string localSharedPath;
+    std::string localSharedCookie;
+    size_t localSharedMappingSize = 0;
+    size_t localSharedTxCount = 0;
+};
+
 namespace {
 
 constexpr std::string_view kUcxStagedMagic = "NIXL_UCX_STAGED_V2";
@@ -459,77 +501,30 @@ class nixlUcxStagedPublicMetadata : public nixlBackendMD {
 public:
     nixlUcxStagedPublicMetadata(const ucx_connection_ptr_t &conn,
                                 std::string agent,
+                                uint64_t region_token,
                                 uintptr_t gpu_base,
                                 size_t gpu_len,
                                 uint64_t gpu_dev_id,
                                 std::string host_id,
-                                size_t slot_size,
-                                size_t slot_window_limit,
-                                bool local_shared_slots,
-                                uint64_t local_shared_region_id,
-                                std::string local_shared_region_cookie,
-                                std::string local_shared_path,
-                                size_t local_shared_mapping_size,
-                                std::vector<uintptr_t> &&slot_addrs,
-                                std::vector<std::vector<nixl::ucx::rkey>> &&slot_rkeys)
+                                std::shared_ptr<nixlUcxStagedRemotePool> remote_pool)
         : nixlBackendMD(false),
           conn(conn),
           agent(std::move(agent)),
+          regionToken(region_token),
           gpuBase(gpu_base),
           gpuLen(gpu_len),
           gpuDevId(gpu_dev_id),
           hostId(std::move(host_id)),
-          slotSize(slot_size),
-          slotWindowLimit(slot_window_limit == 0 ? std::max<size_t>(1, slot_addrs.size() * 4) :
-                                                    slot_window_limit),
-          localSharedSlots(local_shared_slots),
-          localSharedRegionId(local_shared_region_id),
-          localSharedRegionCookie(std::move(local_shared_region_cookie)),
-          localSharedPath(std::move(local_shared_path)),
-          localSharedMappingSize(local_shared_mapping_size),
-          slotAddrs(std::move(slot_addrs)),
-          slotRkeys(std::move(slot_rkeys)) {}
-
-    [[nodiscard]] bool
-    tryAcquireSlotWindow() {
-        const size_t limit = slotWindowLimit;
-        size_t in_use = slotWindowInUse.load(std::memory_order_relaxed);
-        while (in_use < limit) {
-            if (slotWindowInUse.compare_exchange_weak(in_use,
-                                                      in_use + 1,
-                                                      std::memory_order_acq_rel,
-                                                      std::memory_order_relaxed)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    void
-    releaseSlotWindow() {
-        const size_t previous = slotWindowInUse.fetch_sub(1, std::memory_order_acq_rel);
-        if (previous == 0) {
-            slotWindowInUse.fetch_add(1, std::memory_order_relaxed);
-            NIXL_WARN << "UCX staged remote slot window release underflow";
-        }
-    }
+          remotePool(std::move(remote_pool)) {}
 
     const ucx_connection_ptr_t conn;
     const std::string agent;
+    const uint64_t regionToken;
     const uintptr_t gpuBase;
     const size_t gpuLen;
     const uint64_t gpuDevId;
     const std::string hostId;
-    const size_t slotSize;
-    const size_t slotWindowLimit;
-    const bool localSharedSlots;
-    const uint64_t localSharedRegionId;
-    const std::string localSharedRegionCookie;
-    const std::string localSharedPath;
-    const size_t localSharedMappingSize;
-    const std::vector<uintptr_t> slotAddrs;
-    const std::vector<std::vector<nixl::ucx::rkey>> slotRkeys;
-    std::atomic<size_t> slotWindowInUse{0};
+    const std::shared_ptr<nixlUcxStagedRemotePool> remotePool;
 };
 
 [[nodiscard]] nixl_blob_t
@@ -632,7 +627,7 @@ struct nixlUcxStagedChunk {
           remoteGpuAddr(remote_gpu_addr),
           remoteGpuDev(remote_gpu_dev),
           size(chunk_size),
-          localMetadata(local_metadata),
+          localPool(local_metadata ? local_metadata->pool : nullptr),
           remoteMetadata(remote_metadata) {}
 
     const uint64_t id;
@@ -641,7 +636,7 @@ struct nixlUcxStagedChunk {
     const uintptr_t remoteGpuAddr;
     const uint64_t remoteGpuDev;
     const size_t size;
-    nixlUcxStagedPrivateMetadata *localMetadata = nullptr;
+    nixlUcxStagedSlotPool *localPool = nullptr;
     nixlUcxStagedPublicMetadata *remoteMetadata = nullptr;
     size_t localSlotId = 0;
     bool localSlotHeld = false;
@@ -701,16 +696,17 @@ public:
             cudaEventDestroy(chunk.d2hEvent);
             chunk.d2hEvent = nullptr;
         }
-        if (chunk.localMetadata && chunk.localSlotHeld) {
-            chunk.localMetadata->pool->releaseTxSlot(chunk.localSlotId);
+        if (chunk.localPool && chunk.localSlotHeld) {
+            chunk.localPool->releaseTxSlot(chunk.localSlotId);
             chunk.localSlotHeld = false;
         }
     }
 
     void
     releaseRemoteWindow(nixlUcxStagedChunk &chunk) {
-        if (chunk.remoteMetadata && chunk.remoteWindowHeld) {
-            chunk.remoteMetadata->releaseSlotWindow();
+        if (chunk.remoteMetadata && chunk.remoteMetadata->remotePool &&
+            chunk.remoteWindowHeld) {
+            chunk.remoteMetadata->remotePool->releaseSlotWindow();
             chunk.remoteWindowHeld = false;
         }
     }
@@ -737,7 +733,12 @@ public:
     // Returns false when the grant could not be bound to a chunk; a successful
     // grant left unbound must be released by the caller or the target slot leaks.
     [[nodiscard]] bool
-    markGrant(uint64_t chunk_id, uint64_t slot_id, uint64_t lease_id, nixl_status_t status) {
+    markGrant(uint64_t chunk_id,
+              uint64_t slot_id,
+              uint64_t lease_id,
+              uint64_t pool_epoch,
+              nixl_status_t status,
+              bool &epoch_mismatch) {
         if (chunk_id >= chunks.size()) {
             NIXL_WARN << "Received UCX staged slot grant for out-of-range chunk id " << chunk_id
                       << " transfer_id=" << transferId << " chunks=" << chunks.size();
@@ -745,6 +746,17 @@ public:
         }
 
         auto &chunk = *chunks[chunk_id];
+        epoch_mismatch =
+            pool_epoch != 0 && chunk.remoteMetadata && chunk.remoteMetadata->remotePool &&
+            pool_epoch != chunk.remoteMetadata->remotePool->poolEpoch;
+        if (epoch_mismatch) {
+            NIXL_ERROR << "UCX staged SLOT_GRANT pool epoch mismatch transfer_id="
+                       << transferId << " chunk_id=" << chunk_id
+                       << " expected=" << chunk.remoteMetadata->remotePool->poolEpoch
+                       << " received=" << pool_epoch
+                       << "; remote metadata must be reloaded";
+            status = NIXL_ERR_MISMATCH;
+        }
         chunk.remoteSlotId = slot_id;
         chunk.leaseId = lease_id;
         chunk.grantStatus.store(status);
@@ -1950,64 +1962,6 @@ nixlUcxEngine::sendStagedControlAm(const std::string &remote_agent,
                                   deleter);
 }
 
-void
-nixlUcxEngine::registerLocalSharedRegion(const std::string &remote_agent,
-                                         const nixlBackendMD *metadata) const {
-    const auto *staged = dynamic_cast<const nixlUcxStagedPublicMetadata *>(metadata);
-    if (!staged || !staged->localSharedSlots || staged->localSharedRegionId == 0 ||
-        staged->localSharedPath.empty() || staged->localSharedMappingSize == 0 ||
-        staged->slotSize == 0 || staged->slotAddrs.empty()) {
-        return;
-    }
-
-    const std::lock_guard lock(localSharedAttachMutex_);
-    auto &region = localSharedRegions_[localSharedRegionKey(remote_agent,
-                                                            staged->localSharedRegionId)];
-    if (region.refCount == 0) {
-        region.remoteAgent = remote_agent;
-        region.regionId = staged->localSharedRegionId;
-        region.regionCookie = staged->localSharedRegionCookie;
-        region.sharedPath = staged->localSharedPath;
-        region.mappingSize = staged->localSharedMappingSize;
-        region.slotSize = staged->slotSize;
-        region.slotCount = staged->slotAddrs.size();
-    } else if (region.regionCookie != staged->localSharedRegionCookie ||
-               region.sharedPath != staged->localSharedPath ||
-               region.mappingSize != staged->localSharedMappingSize ||
-               region.slotSize != staged->slotSize ||
-               region.slotCount != staged->slotAddrs.size()) {
-        NIXL_WARN << "Conflicting UCX local shared region metadata for agent "
-                  << remote_agent << " region_id=" << staged->localSharedRegionId;
-    }
-    ++region.refCount;
-}
-
-void
-nixlUcxEngine::unregisterLocalSharedRegion(const nixlBackendMD *metadata) const {
-    const auto *staged = dynamic_cast<const nixlUcxStagedPublicMetadata *>(metadata);
-    if (!staged || !staged->localSharedSlots || staged->localSharedRegionId == 0) {
-        return;
-    }
-
-    std::string cleanup_path;
-    {
-        const std::lock_guard lock(localSharedAttachMutex_);
-        const auto key = localSharedRegionKey(staged->agent, staged->localSharedRegionId);
-        const auto it = localSharedRegions_.find(key);
-        if (it == localSharedRegions_.end()) {
-            return;
-        }
-        if (it->second.refCount > 1) {
-            --it->second.refCount;
-            return;
-        }
-        cleanup_path = it->second.sharedPath;
-        localSharedRegions_.erase(it);
-    }
-
-    cleanupLocalSharedAttachmentPath(cleanup_path);
-}
-
 bool
 nixlUcxEngine::validateLocalSharedReady(const std::string &remote_agent,
                                         uint64_t region_id,
@@ -2602,87 +2556,160 @@ nixlUcxEngine::internalStagedMDHelper(const nixl_blob_t &blob,
 
         const std::string magic = ser_des.getStr("magic");
         if (magic != kUcxStagedMagic) {
+            NIXL_ERROR << "UCX staged metadata version mismatch: expected "
+                       << kUcxStagedMagic << " received "
+                       << (magic.empty() ? "<missing>" : magic);
             return NIXL_ERR_MISMATCH;
         }
 
+        uint64_t region_token = 0;
         uintptr_t gpu_base = 0;
-        size_t gpu_len = 0;
+        uint64_t gpu_len_u64 = 0;
         uint64_t gpu_dev_id = 0;
-        size_t slot_size = 0;
-        size_t slot_count = 0;
-        bool local_shared_slots = false;
-        uint64_t local_shared_region_id = 0;
-        size_t local_shared_mapping_size = 0;
-        std::string host_id;
-        std::string local_shared_region_cookie;
+        uint64_t pool_epoch = 0;
+        uint64_t slot_size_u64 = 0;
+        uint64_t slot_stride_u64 = 0;
+        uint64_t rx_count_u64 = 0;
+        uintptr_t rx_base = 0;
+        bool ls_enabled = false;
+        uint64_t ls_mapping_size_u64 = 0;
+        uint64_t ls_tx_count_u64 = 0;
 
-        if (ser_des.getBuf("gpu_base", &gpu_base, sizeof(gpu_base)) != NIXL_SUCCESS ||
-            ser_des.getBuf("gpu_len", &gpu_len, sizeof(gpu_len)) != NIXL_SUCCESS ||
+        if (ser_des.getBuf("region_token",
+                           &region_token,
+                           sizeof(region_token)) != NIXL_SUCCESS ||
+            ser_des.getBuf("gpu_base", &gpu_base, sizeof(gpu_base)) != NIXL_SUCCESS ||
+            ser_des.getBuf("gpu_len", &gpu_len_u64, sizeof(gpu_len_u64)) != NIXL_SUCCESS ||
             ser_des.getBuf("gpu_dev", &gpu_dev_id, sizeof(gpu_dev_id)) != NIXL_SUCCESS ||
-            ser_des.getBuf("slot_size", &slot_size, sizeof(slot_size)) != NIXL_SUCCESS ||
-            ser_des.getBuf("slot_count", &slot_count, sizeof(slot_count)) != NIXL_SUCCESS) {
+            ser_des.getBuf("pool_epoch", &pool_epoch, sizeof(pool_epoch)) != NIXL_SUCCESS ||
+            ser_des.getBuf("slot_size",
+                           &slot_size_u64,
+                           sizeof(slot_size_u64)) != NIXL_SUCCESS ||
+            ser_des.getBuf("slot_stride",
+                           &slot_stride_u64,
+                           sizeof(slot_stride_u64)) != NIXL_SUCCESS ||
+            ser_des.getBuf("rx_count",
+                           &rx_count_u64,
+                           sizeof(rx_count_u64)) != NIXL_SUCCESS ||
+            ser_des.getBuf("rx_base", &rx_base, sizeof(rx_base)) != NIXL_SUCCESS ||
+            ser_des.getBuf("ls_enabled", &ls_enabled, sizeof(ls_enabled)) != NIXL_SUCCESS ||
+            ser_des.getBuf("ls_mapping_size",
+                           &ls_mapping_size_u64,
+                           sizeof(ls_mapping_size_u64)) != NIXL_SUCCESS ||
+            ser_des.getBuf("ls_tx_count",
+                           &ls_tx_count_u64,
+                           sizeof(ls_tx_count_u64)) != NIXL_SUCCESS) {
             return NIXL_ERR_MISMATCH;
         }
-        host_id = ser_des.getStr("host_id");
-        if (host_id.empty()) {
+        const std::string host_id = ser_des.getStr("host_id");
+        const std::string rx_rkey = ser_des.getStr("rx_rkey");
+        const std::string ls_path = ser_des.getStr("ls_path");
+        const std::string ls_cookie = ser_des.getStr("ls_cookie");
+
+        if (region_token == 0 || pool_epoch == 0 || gpu_len_u64 == 0 ||
+            slot_size_u64 == 0 || slot_stride_u64 < slot_size_u64 || host_id.empty() ||
+            gpu_len_u64 > std::numeric_limits<size_t>::max() ||
+            slot_size_u64 > std::numeric_limits<size_t>::max() ||
+            slot_stride_u64 > std::numeric_limits<size_t>::max() ||
+            rx_count_u64 > std::numeric_limits<size_t>::max() ||
+            ls_mapping_size_u64 > std::numeric_limits<size_t>::max() ||
+            ls_tx_count_u64 > std::numeric_limits<size_t>::max()) {
             return NIXL_ERR_MISMATCH;
         }
-        (void)ser_des.getBuf("local_shared_slots",
-                             &local_shared_slots,
-                             sizeof(local_shared_slots));
-        (void)ser_des.getBuf("local_shared_region_id",
-                             &local_shared_region_id,
-                             sizeof(local_shared_region_id));
-        if (blob.find("local_shared_region_cookie") != std::string::npos) {
-            local_shared_region_cookie = ser_des.getStr("local_shared_region_cookie");
+
+        const size_t gpu_len = static_cast<size_t>(gpu_len_u64);
+        const size_t slot_size = static_cast<size_t>(slot_size_u64);
+        const size_t slot_stride = static_cast<size_t>(slot_stride_u64);
+        const size_t rx_count = static_cast<size_t>(rx_count_u64);
+        const size_t ls_mapping_size = static_cast<size_t>(ls_mapping_size_u64);
+        const size_t ls_tx_count = static_cast<size_t>(ls_tx_count_u64);
+        const bool rx_geometry_overflows =
+            rx_count != 0 &&
+            (rx_count > std::numeric_limits<size_t>::max() / slot_stride ||
+             rx_base > std::numeric_limits<uintptr_t>::max() - rx_count * slot_stride);
+        if ((rx_count == 0 && (rx_base != 0 || !rx_rkey.empty())) ||
+            (rx_count != 0 && (rx_base == 0 || rx_rkey.empty())) ||
+            rx_geometry_overflows ||
+            (ls_enabled &&
+             (ls_path.empty() || ls_cookie.empty() || ls_mapping_size == 0 ||
+              ls_tx_count > std::numeric_limits<size_t>::max() / slot_stride ||
+              ls_tx_count * slot_stride > ls_mapping_size)) ||
+            (!ls_enabled &&
+             (!ls_path.empty() || !ls_cookie.empty() || ls_mapping_size != 0 ||
+              ls_tx_count != 0))) {
+            return NIXL_ERR_MISMATCH;
         }
-        const std::string local_shared_path = ser_des.getStr("local_shared_path");
-        (void)ser_des.getBuf("local_shared_mapping_size",
-                             &local_shared_mapping_size,
-                             sizeof(local_shared_mapping_size));
-        if (!local_shared_slots) {
-            local_shared_region_id = 0;
-            local_shared_mapping_size = 0;
-            local_shared_region_cookie.clear();
-        }
 
-        std::vector<uintptr_t> slot_addrs;
-        std::vector<std::vector<nixl::ucx::rkey>> slot_rkeys;
-        slot_addrs.reserve(slot_count);
-        slot_rkeys.reserve(slot_count);
-
-        for (size_t i = 0; i < slot_count; ++i) {
-            uintptr_t slot_addr = 0;
-            if (ser_des.getBuf("slot_addr", &slot_addr, sizeof(slot_addr)) != NIXL_SUCCESS) {
-                return NIXL_ERR_MISMATCH;
-            }
-            const std::string rkey_blob = ser_des.getStr("slot_rkey");
-            if (rkey_blob.empty()) {
-                return NIXL_ERR_MISMATCH;
+        const auto key = std::make_tuple(agent, gpu_dev_id, pool_epoch);
+        std::shared_ptr<nixlUcxStagedRemotePool> remote_pool;
+        {
+            const std::lock_guard lock(remotePoolMutex_);
+            for (auto it = remotePools_.begin(); it != remotePools_.end();) {
+                if (std::get<0>(it->first) == agent &&
+                    std::get<1>(it->first) == gpu_dev_id &&
+                    std::get<2>(it->first) != pool_epoch) {
+                    it = remotePools_.erase(it);
+                } else {
+                    ++it;
+                }
             }
 
-            slot_addrs.push_back(slot_addr);
-            slot_rkeys.emplace_back(
-                makePublicMetadataRkeys(conn, uws.size(), rkey_blob.data()));
+            const auto existing = remotePools_.find(key);
+            if (existing != remotePools_.end()) {
+                remote_pool = existing->second;
+                if (remote_pool->rxBase != rx_base ||
+                    remote_pool->slotStride != slot_stride ||
+                    remote_pool->slotSize != slot_size ||
+                    remote_pool->rxCount != rx_count ||
+                    remote_pool->rxRkeyBlob != rx_rkey ||
+                    remote_pool->localShared != ls_enabled ||
+                    remote_pool->localSharedPath != ls_path ||
+                    remote_pool->localSharedCookie != ls_cookie ||
+                    remote_pool->localSharedMappingSize != ls_mapping_size ||
+                    remote_pool->localSharedTxCount != ls_tx_count) {
+                    NIXL_ERROR << "Conflicting UCX staged pool descriptor agent=" << agent
+                               << " gpu_dev=" << gpu_dev_id
+                               << " pool_epoch=" << pool_epoch;
+                    return NIXL_ERR_MISMATCH;
+                }
+            } else {
+                remote_pool = std::make_shared<nixlUcxStagedRemotePool>();
+                remote_pool->agent = agent;
+                remote_pool->gpuDev = gpu_dev_id;
+                remote_pool->poolEpoch = pool_epoch;
+                remote_pool->rxBase = rx_base;
+                remote_pool->slotStride = slot_stride;
+                remote_pool->slotSize = slot_size;
+                remote_pool->rxCount = rx_count;
+                remote_pool->rxRkeyBlob = rx_rkey;
+                if (rx_count != 0) {
+                    remote_pool->rxRkeys =
+                        makePublicMetadataRkeys(conn, uws.size(), rx_rkey.data());
+                }
+                remote_pool->windowLimit =
+                    vramStagingConfig_.slotRequestWindow != 0 ?
+                    vramStagingConfig_.slotRequestWindow :
+                    (rx_count > std::numeric_limits<size_t>::max() / 4 ?
+                         std::numeric_limits<size_t>::max() :
+                         rx_count * 4);
+                remote_pool->localShared = ls_enabled;
+                remote_pool->localSharedPath = ls_path;
+                remote_pool->localSharedCookie = ls_cookie;
+                remote_pool->localSharedMappingSize = ls_mapping_size;
+                remote_pool->localSharedTxCount = ls_tx_count;
+                remotePools_.emplace(key, remote_pool);
+            }
         }
 
         auto *staged_output = new nixlUcxStagedPublicMetadata(conn,
                                                               agent,
+                                                              region_token,
                                                               gpu_base,
                                                               gpu_len,
                                                               gpu_dev_id,
-                                                              std::move(host_id),
-                                                              slot_size,
-                                                              vramStagingConfig_.slotRequestWindow,
-                                                              local_shared_slots,
-                                                              local_shared_region_id,
-                                                              std::move(local_shared_region_cookie),
-                                                              local_shared_path,
-                                                              local_shared_mapping_size,
-                                                              std::move(slot_addrs),
-                                                              std::move(slot_rkeys));
+                                                              host_id,
+                                                              std::move(remote_pool));
         output = staged_output;
-        registerLocalSharedRegion(agent, staged_output);
         return NIXL_SUCCESS;
     }
     catch (const std::runtime_error &e) {
@@ -2722,16 +2749,20 @@ nixlUcxEngine::completePendingStagedSlotGrant(const std::string &remote_agent,
                                               uint64_t chunk_id,
                                               uint64_t slot_id,
                                               uint64_t lease_id,
+                                              uint64_t pool_epoch,
                                               nixl_status_t status) const {
+    bool bound = false;
+    bool release_epoch_mismatch = false;
     {
         const std::lock_guard lock(stagedReqMutex_);
         const auto it = pendingStagedReqs_.find(transfer_id);
         if (it != pendingStagedReqs_.end()) {
             auto *handle = dynamic_cast<nixlUcxStagedBackendReqH *>(it->second);
             if (handle) {
-                if (handle->markGrant(chunk_id, slot_id, lease_id, status)) {
-                    return;
-                }
+                bool epoch_mismatch = false;
+                bound = handle->markGrant(
+                    chunk_id, slot_id, lease_id, pool_epoch, status, epoch_mismatch);
+                release_epoch_mismatch = bound && epoch_mismatch && status == NIXL_SUCCESS;
                 // markGrant logged the out-of-range chunk id; fall through and
                 // release the unbound grant.
             } else {
@@ -2742,6 +2773,14 @@ nixlUcxEngine::completePendingStagedSlotGrant(const std::string &remote_agent,
             NIXL_WARN << "Received UCX staged slot grant for unknown transfer id " << transfer_id
                       << " chunk_id=" << chunk_id;
         }
+    }
+
+    if (bound) {
+        if (release_epoch_mismatch) {
+            sendStagedSlotRelease(
+                remote_agent, transfer_id, chunk_id, slot_id, lease_id, 0, 0, 0);
+        }
+        return;
     }
 
     // The grant could not be bound to a live chunk (transfer gone, non-staged
@@ -2779,6 +2818,7 @@ nixl_status_t
 nixlUcxEngine::sendStagedSlotReq(const std::string &remote_agent,
                                  uint64_t transfer_id,
                                  uint64_t chunk_id,
+                                 uint64_t region_token,
                                  uintptr_t remote_gpu_addr,
                                  uint64_t remote_gpu_dev,
                                  size_t size,
@@ -2789,6 +2829,7 @@ nixlUcxEngine::sendStagedSlotReq(const std::string &remote_agent,
     ser_des.addStr("name", localAgent);
     ser_des.addBuf("xfer_id", &transfer_id, sizeof(transfer_id));
     ser_des.addBuf("chunk_id", &chunk_id, sizeof(chunk_id));
+    ser_des.addBuf("region_token", &region_token, sizeof(region_token));
     ser_des.addBuf("gpu_addr", &remote_gpu_addr, sizeof(remote_gpu_addr));
     ser_des.addBuf("gpu_dev", &remote_gpu_dev, sizeof(remote_gpu_dev));
     ser_des.addBuf("size", &size, sizeof(size));
@@ -3066,6 +3107,7 @@ nixlUcxEngine::handleStagedSlotReq(const nixl_blob_t &message, ucp_ep_h reply_ep
 
     uint64_t slot_id = 0;
     uint64_t lease_id = 0;
+    uint64_t pool_epoch = 0;
     uint64_t pool_epoch = 0;
     if (remote_agent.empty()) {
         status = NIXL_ERR_MISMATCH;
@@ -3561,7 +3603,6 @@ nixl_status_t nixlUcxEngine::loadRemoteMD (const nixlBlobDesc &input,
 }
 
 nixl_status_t nixlUcxEngine::unloadMD (nixlBackendMD* input) {
-    unregisterLocalSharedRegion(input);
     delete input;
     return NIXL_SUCCESS;
 }
@@ -3892,19 +3933,27 @@ nixlUcxEngine::postStagedWrite(const nixl_meta_dlist_t &local,
                        << lmd->gpuDevId;
             return NIXL_ERR_NOT_SUPPORTED;
         }
-        const size_t chunk_size = std::min(lmd->pool->slotSize, rmd->slotSize);
+        if (!rmd->remotePool) {
+            return NIXL_ERR_MISMATCH;
+        }
+        const size_t chunk_size =
+            std::min(lmd->pool->slotSize, rmd->remotePool->slotSize);
         if (chunk_size == 0) {
             return NIXL_ERR_INVALID_PARAM;
         }
 
-        if (rmd->slotAddrs.empty() || rmd->slotRkeys.empty()) {
-            return NIXL_ERR_MISMATCH;
-        }
         const bool local_shared_write = vramStagingConfig_.localStaging &&
                                         lmd->pool->backing.localShared &&
-                                        rmd->localSharedSlots &&
+                                        rmd->remotePool->localShared &&
                                         !rmd->hostId.empty() &&
                                         rmd->hostId == lmd->hostId;
+        if (!local_shared_write &&
+            (rmd->remotePool->rxCount == 0 || rmd->remotePool->rxRkeys.empty())) {
+            NIXL_ERROR << "UCX staged write cannot start: remote RX role is not configured "
+                          "gpu_dev="
+                       << rmd->gpuDevId;
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
 
         if (desc_size > std::numeric_limits<size_t>::max() - staged_handle->totalSize) {
             return NIXL_ERR_INVALID_PARAM;
@@ -4040,7 +4089,8 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
     };
 
     auto send_slot_request = [&](nixlUcxStagedChunk &chunk) -> nixl_status_t {
-        if (!chunk.remoteMetadata || !chunk.remoteMetadata->tryAcquireSlotWindow()) {
+        if (!chunk.remoteMetadata || !chunk.remoteMetadata->remotePool ||
+            !chunk.remoteMetadata->remotePool->tryAcquireSlotWindow()) {
             ++staged_handle->profile.remoteWindowMiss;
             return NIXL_IN_PROG;
         }
@@ -4064,6 +4114,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
             sendStagedSlotReq(staged_handle->remoteAgent,
                               staged_handle->transferId,
                               chunk.id,
+                              chunk.remoteMetadata->regionToken,
                               chunk.remoteGpuAddr,
                               chunk.remoteGpuDev,
                               chunk.size,
@@ -4112,11 +4163,11 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
     };
 
     auto start_local_d2h_prefetch = [&](nixlUcxStagedChunk &chunk) -> nixl_status_t {
-        if (!chunk.localMetadata) {
+        if (!chunk.localPool) {
             return NIXL_ERR_MISMATCH;
         }
 
-        const auto local_slot = chunk.localMetadata->pool->acquireTxSlot();
+        const auto local_slot = chunk.localPool->acquireTxSlot();
         if (local_slot.status == NIXL_IN_PROG) {
             ++staged_handle->profile.localSlotMiss;
             return NIXL_IN_PROG;
@@ -4154,7 +4205,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
         }
 
         void *local_host_addr =
-            chunk.localMetadata->pool->txHostAddr(chunk.localSlotId);
+            chunk.localPool->txHostAddr(chunk.localSlotId);
         if (local_host_addr == nullptr) {
             cudaEventDestroy(event);
             cudaRestoreDevice(previous_device);
@@ -4259,7 +4310,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
     };
 
     auto start_granted_chunk = [&](nixlUcxStagedChunk &chunk) -> nixl_status_t {
-        if (!chunk.localMetadata || !chunk.remoteMetadata) {
+        if (!chunk.localPool || !chunk.remoteMetadata) {
             return NIXL_ERR_MISMATCH;
         }
 
@@ -4270,7 +4321,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
 
         nixl_status_t ret = NIXL_SUCCESS;
         if (!vramStagingConfig_.sourceD2HPrefetch) {
-            const auto local_slot = chunk.localMetadata->pool->acquireTxSlot();
+            const auto local_slot = chunk.localPool->acquireTxSlot();
             if (local_slot.status == NIXL_IN_PROG) {
                 ++staged_handle->profile.localSlotMiss;
                 return NIXL_IN_PROG;
@@ -4290,7 +4341,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
             }
 
             void *local_host_addr =
-                chunk.localMetadata->pool->txHostAddr(chunk.localSlotId);
+                chunk.localPool->txHostAddr(chunk.localSlotId);
             if (local_host_addr == nullptr) {
                 cudaRestoreDevice(previous_device);
                 staged_handle->releaseChunkSlots(chunk);
@@ -4321,17 +4372,18 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
             return NIXL_ERR_MISMATCH;
         }
 
-        void *local_host_addr = chunk.localMetadata->pool->txHostAddr(chunk.localSlotId);
+        void *local_host_addr = chunk.localPool->txHostAddr(chunk.localSlotId);
         auto *local_mem =
-            static_cast<nixlUcxMem *>(chunk.localMetadata->pool->backing.txRegistration);
+            static_cast<nixlUcxMem *>(chunk.localPool->backing.txRegistration);
         if (local_host_addr == nullptr || local_mem == nullptr) {
             staged_handle->releaseChunkSlots(chunk);
             return NIXL_ERR_MISMATCH;
         }
         const size_t worker_id = staged_handle->getWorkerId();
         const auto *rmd = chunk.remoteMetadata;
-        if (chunk.remoteSlotId >= rmd->slotRkeys.size() ||
-            worker_id >= rmd->slotRkeys[chunk.remoteSlotId].size()) {
+        const auto &remote_pool = *rmd->remotePool;
+        if (chunk.remoteSlotId >= remote_pool.rxCount ||
+            worker_id >= remote_pool.rxRkeys.size()) {
             sendStagedSlotRelease(staged_handle->remoteAgent,
                                   staged_handle->transferId,
                                   chunk.id,
@@ -4353,11 +4405,13 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
         }
 
         const auto &ep = rmd->conn->getEp(worker_id);
+        const uintptr_t remote_slot_addr =
+            remote_pool.rxBase + chunk.remoteSlotId * remote_pool.slotStride;
         nixlUcxReq req = nullptr;
         ret = ep->write(local_host_addr,
                         *local_mem,
-                        rmd->slotAddrs[chunk.remoteSlotId],
-                        rmd->slotRkeys[chunk.remoteSlotId][worker_id],
+                        remote_slot_addr,
+                        remote_pool.rxRkeys[worker_id],
                         chunk.size,
                         req);
         if (vramStagingConfig_.batchFlush) {
@@ -4370,7 +4424,9 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                 batch->remoteMetadata = chunk.remoteMetadata;
                 staged_handle->openFlushBatch = std::move(batch);
             }
-            if (staged_handle->openFlushBatch->remoteMetadata != chunk.remoteMetadata) {
+            if (!staged_handle->openFlushBatch->remoteMetadata ||
+                staged_handle->openFlushBatch->remoteMetadata->remotePool !=
+                    chunk.remoteMetadata->remotePool) {
                 staged_handle->releaseChunkSlots(chunk);
                 return NIXL_ERR_NOT_SUPPORTED;
             }
@@ -4458,13 +4514,12 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
     };
 
     auto send_local_ready = [&](nixlUcxStagedChunk &chunk) -> nixl_status_t {
-        if (!chunk.localMetadata || chunk.localMetadata->pool == nullptr ||
-            !chunk.localMetadata->pool->backing.localShared ||
-            !chunk.localMetadata->pool->backing.base ||
-            chunk.localMetadata->pool->backing.sharedPath.empty()) {
+        if (!chunk.localPool || !chunk.localPool->backing.localShared ||
+            !chunk.localPool->backing.base ||
+            chunk.localPool->backing.sharedPath.empty()) {
             return NIXL_ERR_MISMATCH;
         }
-        const auto &pool = *chunk.localMetadata->pool;
+        const auto &pool = *chunk.localPool;
 
         const auto conn = getConnection(staged_handle->remoteAgent);
         if (!conn) {
@@ -5145,13 +5200,14 @@ nixlUcxEngine::stagedSlotGrantAmCb(void *arg,
         ser_des.getBuf("chunk_id", &chunk_id, sizeof(chunk_id)) != NIXL_SUCCESS ||
         ser_des.getBuf("slot_id", &slot_id, sizeof(slot_id)) != NIXL_SUCCESS ||
         ser_des.getBuf("lease_id", &lease_id, sizeof(lease_id)) != NIXL_SUCCESS ||
+        ser_des.getBuf("pool_epoch", &pool_epoch, sizeof(pool_epoch)) != NIXL_SUCCESS ||
         ser_des.getBuf("status", &status, sizeof(status)) != NIXL_SUCCESS) {
         NIXL_ERROR << "Malformed UCX staged SLOT_GRANT message";
         return UCS_OK;
     }
 
     engine->completePendingStagedSlotGrant(
-        remote_agent, transfer_id, chunk_id, slot_id, lease_id, status);
+        remote_agent, transfer_id, chunk_id, slot_id, lease_id, pool_epoch, status);
     return UCS_OK;
 }
 

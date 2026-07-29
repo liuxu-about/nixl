@@ -314,6 +314,7 @@ private:
                                    uint64_t chunk_id,
                                    uint64_t slot_id,
                                    uint64_t lease_id,
+                                   uint64_t pool_epoch,
                                    nixl_status_t status) const;
 
     void
@@ -339,6 +340,7 @@ private:
     sendStagedSlotReq(const std::string &remote_agent,
                       uint64_t transfer_id,
                       uint64_t chunk_id,
+                      uint64_t region_token,
                       uintptr_t remote_gpu_addr,
                       uint64_t remote_gpu_dev,
                       size_t size,
@@ -465,13 +467,6 @@ private:
 
     void
     stagedH2DWorkerLoop() const;
-
-    void
-    registerLocalSharedRegion(const std::string &remote_agent,
-                              const nixlBackendMD *metadata) const;
-
-    void
-    unregisterLocalSharedRegion(const nixlBackendMD *metadata) const;
 
     [[nodiscard]] bool
     validateLocalSharedReady(const std::string &remote_agent,
@@ -608,6 +603,12 @@ private:
     mutable std::mutex stagedPoolMutex_;
     std::map<uint64_t, std::unique_ptr<nixlUcxStagedSlotPool>> stagedPools_;
     mutable std::atomic<uint64_t> nextRegionToken_{1};
+    // Independent of the target-side locks and never held across UCX
+    // send/progress calls.
+    mutable std::mutex remotePoolMutex_;
+    std::map<std::tuple<std::string, uint64_t, uint64_t>,
+             std::shared_ptr<nixlUcxStagedRemotePool>>
+        remotePools_;
     mutable std::atomic<uint64_t> stagedProfileTargetReadyCount_{0};
     mutable std::atomic<uint64_t> stagedProfileTargetBytes_{0};
     mutable std::atomic<uint64_t> stagedProfileTargetH2DUs_{0};
