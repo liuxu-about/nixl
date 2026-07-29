@@ -271,29 +271,23 @@ build. `self` alone is not enough for two separate Prefill/Decode processes.
 
 ## Metadata Design
 
-Public staged local metadata should be versioned:
+The implemented version does not use a separate local metadata blob: the same-host shared-pool
+descriptor rides in the unified `NIXL_UCX_STAGED_V2` staged metadata (see
+[`ucx_staging_shared_slot_pool.md`](ucx_staging_shared_slot_pool.md)) as its `ls_*` fields:
 
 ```text
-magic = "NIXL_UCX_LOCAL_STAGED_V1"
-mode = "shared_pinned"
-owner = "source" or "target"
-host_id
-pid
-region_id
-gpu_base
-gpu_len
-gpu_dev_id
-slot_size
-slot_count
-shared_object:
-  type = "posix_shm" or "file_mmap"
-  name_or_path
-  total_size
-  data_offset
-capabilities:
-  write = true
-  read = false
+magic = "NIXL_UCX_STAGED_V2"
+...RDMA pool descriptor fields...
+ls_enabled         # local shared staging available
+ls_path            # per-pool shm file (one per GPU device, not per region)
+ls_cookie          # random cookie; LOCAL_WRITE_READY messages must match it
+ls_mapping_size
+ls_tx_count        # TX slots shared through the file, stride = slot_stride
 ```
+
+The target validates every `LOCAL_WRITE_READY` against this metadata-delivered descriptor
+(path, cookie, epoch, slot geometry, generation) before attaching, so an AM message alone can
+never cause an arbitrary path to be mapped.
 
 Private metadata should store:
 

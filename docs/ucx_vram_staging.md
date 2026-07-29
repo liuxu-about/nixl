@@ -281,27 +281,30 @@ The private metadata is used by local request execution and is not serialized di
 
 ### Public Metadata
 
-Public metadata should be versioned so staged peers can reject incompatible metadata early:
+Public metadata is versioned so staged peers can reject incompatible metadata early. The
+implemented format (see [`ucx_staging_shared_slot_pool.md`](ucx_staging_shared_slot_pool.md))
+publishes a per-GPU pool descriptor instead of a per-region slot table:
 
 ```text
-magic = "NIXL_UCX_STAGED_V1"
-mode = "vram_host_staging"
+magic = "NIXL_UCX_STAGED_V2"
+region_token
 gpu_base
 gpu_len
-gpu_dev_id
+gpu_dev
+host_id
+pool_epoch
 slot_size
-slot_count
-slots:
-  slot_id
-  host_addr
-  rkey_blob
-capabilities:
-  write=true
-  read=false
+slot_stride
+rx_count
+rx_base
+rx_rkey            # one packed rkey for the whole RX range
+ls_enabled, ls_path, ls_cookie, ls_mapping_size, ls_tx_count   # same-host shm descriptor
 ```
 
-The first implementation can publish a fixed slot pool per registered region. A later version can
-deduplicate pools across registrations on the same GPU.
+Slot addresses are computed as `rx_base + slot_id * slot_stride`; there are no per-slot
+`host_addr`/`rkey_blob` entries. The pool descriptor is identical across all regions of one GPU
+and is deduplicated by the receiver per `(agent, gpu_dev, pool_epoch)`. The historical V1 format
+(`NIXL_UCX_STAGED_V1`, per-region slot tables) is superseded and rejected at load time.
 
 ## WRITE Protocol
 
