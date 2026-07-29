@@ -557,12 +557,19 @@ serializeStagedMetadata(const nixlUcxStagedPrivateMetadata &metadata) {
     ser_des.addBuf("slot_stride", &slot_stride, sizeof(slot_stride));
     ser_des.addBuf("rx_count", &rx_count, sizeof(rx_count));
     ser_des.addBuf("rx_base", &rx_base, sizeof(rx_base));
-    ser_des.addStr("rx_rkey", pool.backing.rxRkey);
+    // Empty strings do not round-trip cleanly through nixlSerDes (getStr logs an
+    // error for zero-length data), so optional fields are written only when
+    // present; the reader keys off rx_count / ls_enabled, which precede them.
+    if (rx_count != 0) {
+        ser_des.addStr("rx_rkey", pool.backing.rxRkey);
+    }
     ser_des.addBuf("ls_enabled", &ls_enabled, sizeof(ls_enabled));
-    ser_des.addStr("ls_path", ls_enabled ? pool.backing.sharedPath : std::string());
-    ser_des.addStr("ls_cookie", ls_enabled ? pool.backing.sharedCookie : std::string());
-    ser_des.addBuf("ls_mapping_size", &ls_mapping_size, sizeof(ls_mapping_size));
-    ser_des.addBuf("ls_tx_count", &ls_tx_count, sizeof(ls_tx_count));
+    if (ls_enabled) {
+        ser_des.addStr("ls_path", pool.backing.sharedPath);
+        ser_des.addStr("ls_cookie", pool.backing.sharedCookie);
+        ser_des.addBuf("ls_mapping_size", &ls_mapping_size, sizeof(ls_mapping_size));
+        ser_des.addBuf("ls_tx_count", &ls_tx_count, sizeof(ls_tx_count));
+    }
 
     return ser_des.exportStr();
 }
@@ -2729,13 +2736,18 @@ nixlUcxEngine::internalStagedMDHelper(const nixl_blob_t &blob,
         uint64_t ls_mapping_size_u64 = 0;
         uint64_t ls_tx_count_u64 = 0;
 
+        // Reads must follow serializeStagedMetadata's field order exactly:
+        // nixlSerDes is a sequential stream, not a key-value map.
         if (ser_des.getBuf("region_token",
                            &region_token,
                            sizeof(region_token)) != NIXL_SUCCESS ||
             ser_des.getBuf("gpu_base", &gpu_base, sizeof(gpu_base)) != NIXL_SUCCESS ||
             ser_des.getBuf("gpu_len", &gpu_len_u64, sizeof(gpu_len_u64)) != NIXL_SUCCESS ||
-            ser_des.getBuf("gpu_dev", &gpu_dev_id, sizeof(gpu_dev_id)) != NIXL_SUCCESS ||
-            ser_des.getBuf("pool_epoch", &pool_epoch, sizeof(pool_epoch)) != NIXL_SUCCESS ||
+            ser_des.getBuf("gpu_dev", &gpu_dev_id, sizeof(gpu_dev_id)) != NIXL_SUCCESS) {
+            return NIXL_ERR_MISMATCH;
+        }
+        const std::string host_id = ser_des.getStr("host_id");
+        if (ser_des.getBuf("pool_epoch", &pool_epoch, sizeof(pool_epoch)) != NIXL_SUCCESS ||
             ser_des.getBuf("slot_size",
                            &slot_size_u64,
                            sizeof(slot_size_u64)) != NIXL_SUCCESS ||
@@ -2745,20 +2757,30 @@ nixlUcxEngine::internalStagedMDHelper(const nixl_blob_t &blob,
             ser_des.getBuf("rx_count",
                            &rx_count_u64,
                            sizeof(rx_count_u64)) != NIXL_SUCCESS ||
-            ser_des.getBuf("rx_base", &rx_base, sizeof(rx_base)) != NIXL_SUCCESS ||
-            ser_des.getBuf("ls_enabled", &ls_enabled, sizeof(ls_enabled)) != NIXL_SUCCESS ||
-            ser_des.getBuf("ls_mapping_size",
-                           &ls_mapping_size_u64,
-                           sizeof(ls_mapping_size_u64)) != NIXL_SUCCESS ||
-            ser_des.getBuf("ls_tx_count",
-                           &ls_tx_count_u64,
-                           sizeof(ls_tx_count_u64)) != NIXL_SUCCESS) {
+            ser_des.getBuf("rx_base", &rx_base, sizeof(rx_base)) != NIXL_SUCCESS) {
             return NIXL_ERR_MISMATCH;
         }
-        const std::string host_id = ser_des.getStr("host_id");
-        const std::string rx_rkey = ser_des.getStr("rx_rkey");
-        const std::string ls_path = ser_des.getStr("ls_path");
-        const std::string ls_cookie = ser_des.getStr("ls_cookie");
+        std::string rx_rkey;
+        if (rx_count_u64 != 0) {
+            rx_rkey = ser_des.getStr("rx_rkey");
+        }
+        if (ser_des.getBuf("ls_enabled", &ls_enabled, sizeof(ls_enabled)) != NIXL_SUCCESS) {
+            return NIXL_ERR_MISMATCH;
+        }
+        std::string ls_path;
+        std::string ls_cookie;
+        if (ls_enabled) {
+            ls_path = ser_des.getStr("ls_path");
+            ls_cookie = ser_des.getStr("ls_cookie");
+            if (ser_des.getBuf("ls_mapping_size",
+                               &ls_mapping_size_u64,
+                               sizeof(ls_mapping_size_u64)) != NIXL_SUCCESS ||
+                ser_des.getBuf("ls_tx_count",
+                               &ls_tx_count_u64,
+                               sizeof(ls_tx_count_u64)) != NIXL_SUCCESS) {
+                return NIXL_ERR_MISMATCH;
+            }
+        }
 
         if (region_token == 0 || pool_epoch == 0 || gpu_len_u64 == 0 ||
             slot_size_u64 == 0 || slot_stride_u64 < slot_size_u64 || host_id.empty() ||
@@ -3574,31 +3596,37 @@ nixlUcxEngine::handleStagedLocalWriteReady(const nixl_blob_t &message, ucp_ep_h 
     uint64_t gpu_dev = 0;
     size_t size = 0;
 
+    // Reads must follow sendStagedLocalWriteReady's field order exactly:
+    // nixlSerDes is a sequential stream, not a key-value map.
     nixl_status_t status =
         ser_des.getBuf("xfer_id", &transfer_id, sizeof(transfer_id)) == NIXL_SUCCESS &&
                 ser_des.getBuf("chunk_id", &chunk_id, sizeof(chunk_id)) == NIXL_SUCCESS &&
                 ser_des.getBuf("pool_epoch",
                                &pool_epoch,
-                               sizeof(pool_epoch)) == NIXL_SUCCESS &&
-                ser_des.getBuf("tx_slot_id",
-                               &tx_slot_id,
-                               sizeof(tx_slot_id)) == NIXL_SUCCESS &&
-                ser_des.getBuf("tx_generation",
-                               &tx_generation,
-                               sizeof(tx_generation)) == NIXL_SUCCESS &&
-                ser_des.getBuf("tx_offset", &tx_offset, sizeof(tx_offset)) == NIXL_SUCCESS &&
-                ser_des.getBuf("ls_mapping_size",
-                               &ls_mapping_size,
-                               sizeof(ls_mapping_size)) == NIXL_SUCCESS &&
-                ser_des.getBuf("gpu_addr", &gpu_addr, sizeof(gpu_addr)) == NIXL_SUCCESS &&
-                ser_des.getBuf("gpu_dev", &gpu_dev, sizeof(gpu_dev)) == NIXL_SUCCESS &&
-                ser_des.getBuf("size", &size, sizeof(size)) == NIXL_SUCCESS ?
+                               sizeof(pool_epoch)) == NIXL_SUCCESS ?
             NIXL_SUCCESS :
             NIXL_ERR_MISMATCH;
     const std::string ls_cookie =
         status == NIXL_SUCCESS ? ser_des.getStr("ls_cookie") : std::string();
+    if (status == NIXL_SUCCESS &&
+        (ser_des.getBuf("tx_slot_id", &tx_slot_id, sizeof(tx_slot_id)) != NIXL_SUCCESS ||
+         ser_des.getBuf("tx_generation",
+                        &tx_generation,
+                        sizeof(tx_generation)) != NIXL_SUCCESS)) {
+        status = NIXL_ERR_MISMATCH;
+    }
     const std::string ls_path =
         status == NIXL_SUCCESS ? ser_des.getStr("ls_path") : std::string();
+    if (status == NIXL_SUCCESS &&
+        (ser_des.getBuf("tx_offset", &tx_offset, sizeof(tx_offset)) != NIXL_SUCCESS ||
+         ser_des.getBuf("ls_mapping_size",
+                        &ls_mapping_size,
+                        sizeof(ls_mapping_size)) != NIXL_SUCCESS ||
+         ser_des.getBuf("gpu_addr", &gpu_addr, sizeof(gpu_addr)) != NIXL_SUCCESS ||
+         ser_des.getBuf("gpu_dev", &gpu_dev, sizeof(gpu_dev)) != NIXL_SUCCESS ||
+         ser_des.getBuf("size", &size, sizeof(size)) != NIXL_SUCCESS)) {
+        status = NIXL_ERR_MISMATCH;
+    }
 
     if (remote_agent.empty() || pool_epoch == 0 || tx_generation == 0 ||
         ls_cookie.empty() || ls_path.empty() || size == 0 ||
@@ -5003,6 +5031,10 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                     } else {
                         staged_handle->releaseRemoteSlot(chunk);
                     }
+                    // The lease is settled on the target; clear the grant markers so
+                    // the teardown paths' granted-but-unprocessed check does not send
+                    // a stale SLOT_RELEASE for a completed chunk.
+                    chunk.grantArrived.store(false);
                     ++staged_handle->profile.ackReceived;
                     const uint64_t ack_arrived_us = chunk.ackArrivedUs.load();
                     if (ack_arrived_us > chunk.ackWaitStartUs) {
@@ -5351,6 +5383,7 @@ nixlUcxEngine::stagedSlotGrantAmCb(void *arg,
     uint64_t chunk_id = 0;
     uint64_t slot_id = 0;
     uint64_t lease_id = 0;
+    uint64_t pool_epoch = 0;
     nixl_status_t status = NIXL_ERR_MISMATCH;
     if (remote_agent.empty() ||
         ser_des.getBuf("xfer_id", &transfer_id, sizeof(transfer_id)) != NIXL_SUCCESS ||
