@@ -184,6 +184,19 @@ TEST_F(StagedPoolTest, ZeroSizedPartitionsReturnRoleErrors) {
     EXPECT_EQ(reserve(*tx_only, "peer", 1, 1).status, NIXL_ERR_NOT_SUPPORTED);
 }
 
+TEST_F(StagedPoolTest, TxGenerationAdvancesAtPoolScopeOnReuse) {
+    auto pool = makePool(1, 1);
+    const auto first = pool->acquireTxSlot();
+    ASSERT_EQ(first.status, NIXL_SUCCESS);
+    EXPECT_EQ(pool->txGeneration(first.slotId), 1u);
+    pool->releaseTxSlot(first.slotId);
+
+    const auto second = pool->acquireTxSlot();
+    ASSERT_EQ(second.status, NIXL_SUCCESS);
+    EXPECT_EQ(second.slotId, first.slotId);
+    EXPECT_EQ(pool->txGeneration(second.slotId), 2u);
+}
+
 TEST_F(StagedPoolTest, TokenBookkeepingSurvivesReserveBeginAndQuarantine) {
     auto pool = makePool(1, 2);
     const auto h2d = reserve(*pool, "a", 1, 1, 41);

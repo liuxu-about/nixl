@@ -389,13 +389,13 @@ private:
     sendStagedLocalWriteReady(const std::string &remote_agent,
                               uint64_t transfer_id,
                               uint64_t chunk_id,
-                              uint64_t source_region_id,
-                              const std::string &source_region_cookie,
-                              uint64_t source_slot_id,
-                              uint64_t source_slot_generation,
-                              const std::string &source_shared_path,
-                              size_t source_slot_offset,
-                              size_t source_mapping_size,
+                              uint64_t pool_epoch,
+                              const std::string &ls_cookie,
+                              uint64_t tx_slot_id,
+                              uint64_t tx_generation,
+                              const std::string &ls_path,
+                              size_t tx_offset,
+                              size_t ls_mapping_size,
                               uintptr_t remote_gpu_addr,
                               uint64_t remote_gpu_dev,
                               size_t size,
@@ -442,21 +442,11 @@ private:
     struct LocalSharedAttachment {
         std::string path;
         std::string remoteAgent;
+        uint64_t poolEpoch = 0;
         void *base = nullptr;
         size_t mappingSize = 0;
         int fd = -1;
         bool hostRegistered = false;
-    };
-
-    struct LocalSharedRegionInfo {
-        std::string remoteAgent;
-        uint64_t regionId = 0;
-        std::string regionCookie;
-        std::string sharedPath;
-        size_t mappingSize = 0;
-        size_t slotSize = 0;
-        size_t slotCount = 0;
-        size_t refCount = 0;
     };
 
     void
@@ -470,16 +460,18 @@ private:
 
     [[nodiscard]] bool
     validateLocalSharedReady(const std::string &remote_agent,
-                             uint64_t region_id,
-                             const std::string &region_cookie,
-                             const std::string &shared_path,
+                             uint64_t pool_epoch,
+                             const std::string &ls_cookie,
+                             const std::string &ls_path,
                              uint64_t slot_id,
+                             uint64_t generation,
                              size_t slot_offset,
                              size_t mapping_size,
                              size_t size) const;
 
     nixl_status_t
     getLocalSharedAttachment(const std::string &remote_agent,
+                             uint64_t pool_epoch,
                              const std::string &path,
                              size_t mapping_size,
                              std::shared_ptr<LocalSharedAttachment> &attachment) const;
@@ -489,9 +481,6 @@ private:
 
     void
     cleanupLocalSharedAttachmentsForAgent(const std::string &remote_agent);
-
-    void
-    cleanupLocalSharedAttachmentPath(const std::string &path) const;
 
     static void
     releaseLocalSharedAttachment(std::shared_ptr<LocalSharedAttachment> &attachment);
@@ -630,7 +619,6 @@ private:
     mutable std::mutex localSharedAttachMutex_;
     mutable std::unordered_map<std::string, std::shared_ptr<LocalSharedAttachment>>
         localSharedAttachments_;
-    mutable std::unordered_map<std::string, LocalSharedRegionInfo> localSharedRegions_;
 
     // Map of agent name to saved nixlUcxConnection info.
     // Guarded by remoteConnMapMutex_: read from app threads and from staged AM

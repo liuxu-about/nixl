@@ -219,6 +219,11 @@ pathIsUnderDirectory(const std::string &path, const std::string &directory) {
 }
 
 [[nodiscard]] std::string
+localSharedPoolKey(const std::string &remote_agent, uint64_t pool_epoch) {
+    return remote_agent + "#" + std::to_string(pool_epoch);
+}
+
+[[nodiscard]] std::string
 envString(std::string_view name, const std::string &default_value) {
     const char *value = std::getenv(std::string(name).c_str());
     return value != nullptr && value[0] != '\0' ? std::string(value) : default_value;
@@ -1692,10 +1697,11 @@ nixlUcxEngine::enqueueStagedH2D(StagedH2DTask &&task) const {
 nixl_status_t
 nixlUcxEngine::getLocalSharedAttachment(
     const std::string &remote_agent,
+    uint64_t pool_epoch,
     const std::string &path,
     size_t mapping_size,
     std::shared_ptr<LocalSharedAttachment> &attachment) const {
-    if (remote_agent.empty() || path.empty() || mapping_size == 0) {
+    if (remote_agent.empty() || pool_epoch == 0 || path.empty() || mapping_size == 0) {
         return NIXL_ERR_INVALID_PARAM;
     }
 
@@ -1709,12 +1715,15 @@ nixlUcxEngine::getLocalSharedAttachment(
         return NIXL_ERR_INVALID_PARAM;
     }
 
+    const std::string attachment_key = localSharedPoolKey(remote_agent, pool_epoch);
     {
         const std::lock_guard lock(localSharedAttachMutex_);
-        const auto it = localSharedAttachments_.find(*canonical_path);
+        const auto it = localSharedAttachments_.find(attachment_key);
         if (it != localSharedAttachments_.end()) {
             if (it->second->mappingSize != mapping_size ||
-                it->second->remoteAgent != remote_agent) {
+                it->second->remoteAgent != remote_agent ||
+                it->second->poolEpoch != pool_epoch ||
+                it->second->path != *canonical_path) {
                 localSharedAttachFailures_.fetch_add(1, std::memory_order_relaxed);
                 return NIXL_ERR_MISMATCH;
             }
@@ -1729,6 +1738,7 @@ nixlUcxEngine::getLocalSharedAttachment(
     auto new_attachment = std::make_shared<LocalSharedAttachment>();
     new_attachment->path = *canonical_path;
     new_attachment->remoteAgent = remote_agent;
+    new_attachment->poolEpoch = pool_epoch;
     new_attachment->mappingSize = mapping_size;
     new_attachment->fd = open(canonical_path->c_str(), O_RDWR | O_NOFOLLOW);
     if (new_attachment->fd < 0) {
@@ -1738,6 +1748,19 @@ nixlUcxEngine::getLocalSharedAttachment(
         localSharedAttachUs_.fetch_add(profileNowUs() - attach_start_us,
                                        std::memory_order_relaxed);
         return NIXL_ERR_BACKEND;
+    }
+    struct stat file_stat = {};
+    if (fstat(new_attachment->fd, &file_stat) != 0 ||
+        !S_ISREG(file_stat.st_mode) ||
+        file_stat.st_size != static_cast<off_t>(mapping_size)) {
+        NIXL_ERROR << "UCX local staging source file geometry mismatch path="
+                   << *canonical_path << " expected_size=" << mapping_size;
+        close(new_attachment->fd);
+        new_attachment->fd = -1;
+        localSharedAttachFailures_.fetch_add(1, std::memory_order_relaxed);
+        localSharedAttachUs_.fetch_add(profileNowUs() - attach_start_us,
+                                       std::memory_order_relaxed);
+        return NIXL_ERR_MISMATCH;
     }
 
     new_attachment->base =
@@ -1773,13 +1796,16 @@ nixlUcxEngine::getLocalSharedAttachment(
 
     {
         const std::lock_guard lock(localSharedAttachMutex_);
-        const auto [it, inserted] = localSharedAttachments_.emplace(*canonical_path, new_attachment);
+        const auto [it, inserted] =
+            localSharedAttachments_.emplace(attachment_key, new_attachment);
         if (!inserted) {
             cudaHostUnregister(new_attachment->base);
             munmap(new_attachment->base, mapping_size);
             close(new_attachment->fd);
             if (it->second->mappingSize != mapping_size ||
-                it->second->remoteAgent != remote_agent) {
+                it->second->remoteAgent != remote_agent ||
+                it->second->poolEpoch != pool_epoch ||
+                it->second->path != *canonical_path) {
                 localSharedAttachFailures_.fetch_add(1, std::memory_order_relaxed);
                 return NIXL_ERR_MISMATCH;
             }
@@ -1818,7 +1844,6 @@ nixlUcxEngine::cleanupLocalSharedAttachments() {
     {
         const std::lock_guard lock(localSharedAttachMutex_);
         attachments.swap(localSharedAttachments_);
-        localSharedRegions_.clear();
     }
 
     for (auto &[path, attachment] : attachments) {
@@ -1839,13 +1864,6 @@ nixlUcxEngine::cleanupLocalSharedAttachmentsForAgent(const std::string &remote_a
                 ++it;
             }
         }
-        for (auto it = localSharedRegions_.begin(); it != localSharedRegions_.end();) {
-            if (it->second.remoteAgent == remote_agent) {
-                it = localSharedRegions_.erase(it);
-            } else {
-                ++it;
-            }
-        }
     }
 
     for (auto &attachment : removed) {
@@ -1853,29 +1871,7 @@ nixlUcxEngine::cleanupLocalSharedAttachmentsForAgent(const std::string &remote_a
     }
 }
 
-void
-nixlUcxEngine::cleanupLocalSharedAttachmentPath(const std::string &path) const {
-    std::shared_ptr<LocalSharedAttachment> removed;
-    {
-        const std::lock_guard lock(localSharedAttachMutex_);
-        const auto canonical_path = canonicalPath(path);
-        const std::string key = canonical_path ? *canonical_path : path;
-        const auto it = localSharedAttachments_.find(key);
-        if (it != localSharedAttachments_.end()) {
-            removed = it->second;
-            localSharedAttachments_.erase(it);
-        }
-    }
-
-    releaseLocalSharedAttachment(removed);
-}
-
 namespace {
-
-[[nodiscard]] std::string
-localSharedRegionKey(const std::string &remote_agent, uint64_t region_id) {
-    return remote_agent + "#" + std::to_string(region_id);
-}
 
 struct RawAmSendCtx {
     std::string *buffer = nullptr;
@@ -1964,60 +1960,51 @@ nixlUcxEngine::sendStagedControlAm(const std::string &remote_agent,
 
 bool
 nixlUcxEngine::validateLocalSharedReady(const std::string &remote_agent,
-                                        uint64_t region_id,
-                                        const std::string &region_cookie,
-                                        const std::string &shared_path,
+                                        uint64_t pool_epoch,
+                                        const std::string &ls_cookie,
+                                        const std::string &ls_path,
                                         uint64_t slot_id,
+                                        uint64_t generation,
                                         size_t slot_offset,
                                         size_t mapping_size,
                                         size_t size) const {
-    if (remote_agent.empty() || region_id == 0 || shared_path.empty() ||
-        mapping_size == 0 || size == 0) {
+    if (remote_agent.empty() || pool_epoch == 0 || ls_cookie.empty() ||
+        ls_path.empty() || generation == 0 || mapping_size == 0 || size == 0) {
         return false;
     }
 
-    const std::lock_guard lock(localSharedAttachMutex_);
-    const auto it = localSharedRegions_.find(localSharedRegionKey(remote_agent, region_id));
-    if (it == localSharedRegions_.end()) {
-        const auto canonical_dir = canonicalPath(vramStagingConfig_.localStagingShmDir);
-        const auto canonical_path = canonicalPath(shared_path);
-        const std::string expected_agent = sanitizePathComponent(remote_agent);
-        if (!canonical_dir || !canonical_path ||
-            !pathIsUnderDirectory(*canonical_path, *canonical_dir) ||
-            expected_agent.empty() ||
-            canonical_path->find(expected_agent) == std::string::npos ||
-            canonical_path->find(std::to_string(region_id)) == std::string::npos ||
-            (!region_cookie.empty() && canonical_path->find(region_cookie) == std::string::npos) ||
-            size > vramStagingConfig_.chunkSize) {
-            return false;
+    std::shared_ptr<nixlUcxStagedRemotePool> pool;
+    {
+        const std::lock_guard lock(remotePoolMutex_);
+        for (const auto &[key, candidate] : remotePools_) {
+            if (std::get<0>(key) != remote_agent ||
+                std::get<2>(key) != pool_epoch) {
+                continue;
+            }
+            if (pool) {
+                NIXL_ERROR << "Ambiguous UCX local staged pool epoch for agent "
+                           << remote_agent << " epoch=" << pool_epoch;
+                return false;
+            }
+            pool = candidate;
         }
-
-        const size_t slot_span = roundUp(vramStagingConfig_.chunkSize, pageSize());
-        if (slot_id > std::numeric_limits<size_t>::max() / slot_span) {
-            return false;
-        }
-        const size_t expected_offset = static_cast<size_t>(slot_id) * slot_span;
-        return slot_offset == expected_offset &&
-               slot_offset <= mapping_size &&
-               size <= mapping_size - slot_offset;
     }
 
-    const auto &region = it->second;
-    if (region.sharedPath != shared_path ||
-        (!region.regionCookie.empty() && region_cookie != region.regionCookie) ||
-        region.mappingSize != mapping_size ||
-        slot_id >= region.slotCount || size > region.slotSize) {
+    if (!pool || !pool->localShared || pool->localSharedPath != ls_path ||
+        pool->localSharedCookie != ls_cookie ||
+        pool->localSharedMappingSize != mapping_size ||
+        slot_id >= pool->localSharedTxCount || size > pool->slotSize ||
+        slot_id > std::numeric_limits<size_t>::max() / pool->slotStride ||
+        pool->localSharedTxCount >
+            std::numeric_limits<size_t>::max() / pool->slotStride) {
         return false;
     }
 
-    const size_t slot_span = roundUp(region.slotSize, pageSize());
-    if (slot_id > std::numeric_limits<size_t>::max() / slot_span) {
-        return false;
-    }
-    const size_t expected_offset = static_cast<size_t>(slot_id) * slot_span;
+    const size_t expected_offset = static_cast<size_t>(slot_id) * pool->slotStride;
+    const size_t tx_bytes = pool->localSharedTxCount * pool->slotStride;
     return slot_offset == expected_offset &&
-           slot_offset <= mapping_size &&
-           size <= mapping_size - slot_offset;
+           slot_offset <= mapping_size && size <= mapping_size - slot_offset &&
+           slot_offset <= tx_bytes && size <= tx_bytes - slot_offset;
 }
 
 void
@@ -2310,6 +2297,11 @@ nixlUcxEngine::ensureStagedPool(uint64_t gpu_dev, nixlUcxStagedSlotPool *&pool) 
     }
 
     const size_t slot_stride = roundUp(vramStagingConfig_.chunkSize, pageSize());
+    if (vramStagingConfig_.txSlots >
+        std::numeric_limits<size_t>::max() - vramStagingConfig_.rxSlots) {
+        NIXL_ERROR << "UCX staged pool slot count overflow gpu_dev=" << gpu_dev;
+        return NIXL_ERR_INVALID_PARAM;
+    }
     const size_t total_slots = vramStagingConfig_.txSlots + vramStagingConfig_.rxSlots;
     if (slot_stride == 0 || total_slots > std::numeric_limits<size_t>::max() / slot_stride) {
         NIXL_ERROR << "UCX staged pool size overflow gpu_dev=" << gpu_dev
@@ -2319,14 +2311,7 @@ nixlUcxEngine::ensureStagedPool(uint64_t gpu_dev, nixlUcxStagedSlotPool *&pool) 
 
     nixlUcxStagedSlotPool::Backing backing;
     backing.mappingSize = total_slots * slot_stride;
-    const cudaError_t alloc_ret =
-        cudaHostAlloc(&backing.base, backing.mappingSize, cudaHostAllocPortable);
-    if (alloc_ret != cudaSuccess) {
-        NIXL_ERROR << "cudaHostAlloc failed for UCX staged pool gpu_dev=" << gpu_dev
-                   << " bytes=" << backing.mappingSize << ": "
-                   << cudaGetErrorString(alloc_ret);
-        return NIXL_ERR_BACKEND;
-    }
+    const uint64_t pool_epoch = newStagingPoolEpoch();
 
     auto cleanup = [&]() {
         if (backing.rxRegistration != nullptr) {
@@ -2342,10 +2327,88 @@ nixlUcxEngine::ensureStagedPool(uint64_t gpu_dev, nixlUcxStagedSlotPool *&pool) 
             backing.txRegistration = nullptr;
         }
         if (backing.base != nullptr) {
-            cudaFreeHost(backing.base);
+            if (backing.localShared) {
+                if (backing.hostRegistered) {
+                    cudaHostUnregister(backing.base);
+                    backing.hostRegistered = false;
+                }
+                munmap(backing.base, backing.mappingSize);
+            } else {
+                cudaFreeHost(backing.base);
+            }
             backing.base = nullptr;
         }
+        if (backing.sharedFd >= 0) {
+            close(backing.sharedFd);
+            backing.sharedFd = -1;
+        }
+        if (backing.unlinkSharedPath && !backing.sharedPath.empty()) {
+            unlink(backing.sharedPath.c_str());
+            backing.unlinkSharedPath = false;
+        }
     };
+
+    if (vramStagingConfig_.localStaging) {
+        const nixl_status_t dir_status =
+            ensureDirectory(vramStagingConfig_.localStagingShmDir);
+        if (dir_status != NIXL_SUCCESS) {
+            return dir_status;
+        }
+        backing.localShared = true;
+        backing.sharedCookie = newLocalSharedRegionCookie();
+        backing.sharedPath = vramStagingConfig_.localStagingShmDir + "/nixl-ucx-pool-" +
+                             sanitizePathComponent(localAgent) + "-" +
+                             std::to_string(getpid()) + "-" + std::to_string(gpu_dev) + "-" +
+                             std::to_string(pool_epoch) + ".bin";
+        backing.sharedFd =
+            open(backing.sharedPath.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (backing.sharedFd < 0) {
+            NIXL_ERROR << "Failed to create UCX local staging pool file "
+                       << backing.sharedPath << ": " << std::strerror(errno);
+            cleanup();
+            return NIXL_ERR_BACKEND;
+        }
+        backing.unlinkSharedPath = true;
+        if (ftruncate(backing.sharedFd, static_cast<off_t>(backing.mappingSize)) != 0) {
+            NIXL_ERROR << "Failed to size UCX local staging pool file "
+                       << backing.sharedPath << ": " << std::strerror(errno);
+            cleanup();
+            return NIXL_ERR_BACKEND;
+        }
+        backing.base = mmap(nullptr,
+                            backing.mappingSize,
+                            PROT_READ | PROT_WRITE,
+                            MAP_SHARED,
+                            backing.sharedFd,
+                            0);
+        if (backing.base == MAP_FAILED) {
+            NIXL_ERROR << "Failed to mmap UCX local staging pool file "
+                       << backing.sharedPath << ": " << std::strerror(errno);
+            backing.base = nullptr;
+            cleanup();
+            return NIXL_ERR_BACKEND;
+        }
+        const cudaError_t register_ret =
+            cudaHostRegister(backing.base,
+                             backing.mappingSize,
+                             cudaHostRegisterDefault);
+        if (register_ret != cudaSuccess) {
+            NIXL_ERROR << "cudaHostRegister failed for UCX local staging pool file "
+                       << backing.sharedPath << ": " << cudaGetErrorString(register_ret);
+            cleanup();
+            return NIXL_ERR_BACKEND;
+        }
+        backing.hostRegistered = true;
+    } else {
+        const cudaError_t alloc_ret =
+            cudaHostAlloc(&backing.base, backing.mappingSize, cudaHostAllocPortable);
+        if (alloc_ret != cudaSuccess) {
+            NIXL_ERROR << "cudaHostAlloc failed for UCX staged pool gpu_dev=" << gpu_dev
+                       << " bytes=" << backing.mappingSize << ": "
+                       << cudaGetErrorString(alloc_ret);
+            return NIXL_ERR_BACKEND;
+        }
+    }
 
     if (vramStagingConfig_.txSlots != 0) {
         auto tx_mem = std::make_unique<nixlUcxMem>();
@@ -2380,7 +2443,7 @@ nixlUcxEngine::ensureStagedPool(uint64_t gpu_dev, nixlUcxStagedSlotPool *&pool) 
 
     auto created = std::make_unique<nixlUcxStagedSlotPool>(
         gpu_dev,
-        newStagingPoolEpoch(),
+        pool_epoch,
         vramStagingConfig_.chunkSize,
         slot_stride,
         vramStagingConfig_.txSlots,
@@ -2642,12 +2705,14 @@ nixlUcxEngine::internalStagedMDHelper(const nixl_blob_t &blob,
 
         const auto key = std::make_tuple(agent, gpu_dev_id, pool_epoch);
         std::shared_ptr<nixlUcxStagedRemotePool> remote_pool;
+        std::vector<uint64_t> stale_epochs;
         {
             const std::lock_guard lock(remotePoolMutex_);
             for (auto it = remotePools_.begin(); it != remotePools_.end();) {
                 if (std::get<0>(it->first) == agent &&
                     std::get<1>(it->first) == gpu_dev_id &&
                     std::get<2>(it->first) != pool_epoch) {
+                    stale_epochs.push_back(std::get<2>(it->first));
                     it = remotePools_.erase(it);
                 } else {
                     ++it;
@@ -2698,6 +2763,23 @@ nixlUcxEngine::internalStagedMDHelper(const nixl_blob_t &blob,
                 remote_pool->localSharedMappingSize = ls_mapping_size;
                 remote_pool->localSharedTxCount = ls_tx_count;
                 remotePools_.emplace(key, remote_pool);
+            }
+        }
+        if (!stale_epochs.empty()) {
+            std::vector<std::shared_ptr<LocalSharedAttachment>> stale_attachments;
+            {
+                const std::lock_guard lock(localSharedAttachMutex_);
+                for (uint64_t stale_epoch : stale_epochs) {
+                    const auto attachment_it =
+                        localSharedAttachments_.find(localSharedPoolKey(agent, stale_epoch));
+                    if (attachment_it != localSharedAttachments_.end()) {
+                        stale_attachments.push_back(attachment_it->second);
+                        localSharedAttachments_.erase(attachment_it);
+                    }
+                }
+            }
+            for (auto &attachment : stale_attachments) {
+                releaseLocalSharedAttachment(attachment);
             }
         }
 
@@ -2990,13 +3072,13 @@ nixl_status_t
 nixlUcxEngine::sendStagedLocalWriteReady(const std::string &remote_agent,
                                          uint64_t transfer_id,
                                          uint64_t chunk_id,
-                                         uint64_t source_region_id,
-                                         const std::string &source_region_cookie,
-                                         uint64_t source_slot_id,
-                                         uint64_t source_slot_generation,
-                                         const std::string &source_shared_path,
-                                         size_t source_slot_offset,
-                                         size_t source_mapping_size,
+                                         uint64_t pool_epoch,
+                                         const std::string &ls_cookie,
+                                         uint64_t tx_slot_id,
+                                         uint64_t tx_generation,
+                                         const std::string &ls_path,
+                                         size_t tx_offset,
+                                         size_t ls_mapping_size,
                                          uintptr_t remote_gpu_addr,
                                          uint64_t remote_gpu_dev,
                                          size_t size,
@@ -3007,15 +3089,13 @@ nixlUcxEngine::sendStagedLocalWriteReady(const std::string &remote_agent,
     ser_des.addStr("name", localAgent);
     ser_des.addBuf("xfer_id", &transfer_id, sizeof(transfer_id));
     ser_des.addBuf("chunk_id", &chunk_id, sizeof(chunk_id));
-    ser_des.addBuf("source_region_id", &source_region_id, sizeof(source_region_id));
-    if (!source_region_cookie.empty()) {
-        ser_des.addStr("source_region_cookie", source_region_cookie);
-    }
-    ser_des.addBuf("source_slot_id", &source_slot_id, sizeof(source_slot_id));
-    ser_des.addBuf("source_slot_generation", &source_slot_generation, sizeof(source_slot_generation));
-    ser_des.addStr("source_shared_path", source_shared_path);
-    ser_des.addBuf("source_slot_offset", &source_slot_offset, sizeof(source_slot_offset));
-    ser_des.addBuf("source_mapping_size", &source_mapping_size, sizeof(source_mapping_size));
+    ser_des.addBuf("pool_epoch", &pool_epoch, sizeof(pool_epoch));
+    ser_des.addStr("ls_cookie", ls_cookie);
+    ser_des.addBuf("tx_slot_id", &tx_slot_id, sizeof(tx_slot_id));
+    ser_des.addBuf("tx_generation", &tx_generation, sizeof(tx_generation));
+    ser_des.addStr("ls_path", ls_path);
+    ser_des.addBuf("tx_offset", &tx_offset, sizeof(tx_offset));
+    ser_des.addBuf("ls_mapping_size", &ls_mapping_size, sizeof(ls_mapping_size));
     ser_des.addBuf("gpu_addr", &remote_gpu_addr, sizeof(remote_gpu_addr));
     ser_des.addBuf("gpu_dev", &remote_gpu_dev, sizeof(remote_gpu_dev));
     ser_des.addBuf("size", &size, sizeof(size));
@@ -3030,9 +3110,8 @@ nixlUcxEngine::sendStagedLocalWriteReady(const std::string &remote_agent,
 
     NIXL_TRACE << "Sending UCX staged LOCAL_WRITE_READY transfer_id=" << transfer_id
                << " chunk_id=" << chunk_id << " remote_agent=" << remote_agent
-               << " source_region_id=" << source_region_id
-               << " source_slot_id=" << source_slot_id
-               << " source_slot_generation=" << source_slot_generation
+               << " pool_epoch=" << pool_epoch << " tx_slot_id=" << tx_slot_id
+               << " tx_generation=" << tx_generation
                << " bytes=" << size;
 
     return ep->sendAm(nixl::ucx::am_cb_op_t::STAGED_LOCAL_WRITE_READY,
@@ -3396,12 +3475,11 @@ nixlUcxEngine::handleStagedLocalWriteReady(const nixl_blob_t &message, ucp_ep_h 
     const std::string remote_agent = ser_des.getStr("name");
     uint64_t transfer_id = 0;
     uint64_t chunk_id = 0;
-    uint64_t source_region_id = 0;
-    std::string source_region_cookie;
-    uint64_t source_slot_id = 0;
-    uint64_t source_slot_generation = 0;
-    size_t source_slot_offset = 0;
-    size_t source_mapping_size = 0;
+    uint64_t pool_epoch = 0;
+    uint64_t tx_slot_id = 0;
+    uint64_t tx_generation = 0;
+    size_t tx_offset = 0;
+    size_t ls_mapping_size = 0;
     uintptr_t gpu_addr = 0;
     uint64_t gpu_dev = 0;
     size_t size = 0;
@@ -3409,64 +3487,52 @@ nixlUcxEngine::handleStagedLocalWriteReady(const nixl_blob_t &message, ucp_ep_h 
     nixl_status_t status =
         ser_des.getBuf("xfer_id", &transfer_id, sizeof(transfer_id)) == NIXL_SUCCESS &&
                 ser_des.getBuf("chunk_id", &chunk_id, sizeof(chunk_id)) == NIXL_SUCCESS &&
-                ser_des.getBuf("source_region_id",
-                               &source_region_id,
-                               sizeof(source_region_id)) == NIXL_SUCCESS ?
+                ser_des.getBuf("pool_epoch",
+                               &pool_epoch,
+                               sizeof(pool_epoch)) == NIXL_SUCCESS &&
+                ser_des.getBuf("tx_slot_id",
+                               &tx_slot_id,
+                               sizeof(tx_slot_id)) == NIXL_SUCCESS &&
+                ser_des.getBuf("tx_generation",
+                               &tx_generation,
+                               sizeof(tx_generation)) == NIXL_SUCCESS &&
+                ser_des.getBuf("tx_offset", &tx_offset, sizeof(tx_offset)) == NIXL_SUCCESS &&
+                ser_des.getBuf("ls_mapping_size",
+                               &ls_mapping_size,
+                               sizeof(ls_mapping_size)) == NIXL_SUCCESS &&
+                ser_des.getBuf("gpu_addr", &gpu_addr, sizeof(gpu_addr)) == NIXL_SUCCESS &&
+                ser_des.getBuf("gpu_dev", &gpu_dev, sizeof(gpu_dev)) == NIXL_SUCCESS &&
+                ser_des.getBuf("size", &size, sizeof(size)) == NIXL_SUCCESS ?
             NIXL_SUCCESS :
             NIXL_ERR_MISMATCH;
-    if (status == NIXL_SUCCESS &&
-        message.find("source_region_cookie") != std::string::npos) {
-        source_region_cookie = ser_des.getStr("source_region_cookie");
-    }
-    if (status == NIXL_SUCCESS) {
-        status =
-            ser_des.getBuf("source_slot_id", &source_slot_id, sizeof(source_slot_id)) ==
-                        NIXL_SUCCESS &&
-                    ser_des.getBuf("source_slot_generation",
-                                   &source_slot_generation,
-                                   sizeof(source_slot_generation)) == NIXL_SUCCESS ?
-                NIXL_SUCCESS :
-                NIXL_ERR_MISMATCH;
-    }
-    const std::string source_shared_path =
-        status == NIXL_SUCCESS ? ser_des.getStr("source_shared_path") : std::string();
-    if (status == NIXL_SUCCESS) {
-        status =
-            ser_des.getBuf("source_slot_offset",
-                           &source_slot_offset,
-                           sizeof(source_slot_offset)) == NIXL_SUCCESS &&
-                    ser_des.getBuf("source_mapping_size",
-                                   &source_mapping_size,
-                                   sizeof(source_mapping_size)) == NIXL_SUCCESS &&
-                    ser_des.getBuf("gpu_addr", &gpu_addr, sizeof(gpu_addr)) == NIXL_SUCCESS &&
-                    ser_des.getBuf("gpu_dev", &gpu_dev, sizeof(gpu_dev)) == NIXL_SUCCESS &&
-                    ser_des.getBuf("size", &size, sizeof(size)) == NIXL_SUCCESS ?
-                NIXL_SUCCESS :
-                NIXL_ERR_MISMATCH;
-    }
+    const std::string ls_cookie =
+        status == NIXL_SUCCESS ? ser_des.getStr("ls_cookie") : std::string();
+    const std::string ls_path =
+        status == NIXL_SUCCESS ? ser_des.getStr("ls_path") : std::string();
 
-    if (remote_agent.empty() || source_region_id == 0 || source_slot_generation == 0 ||
-        source_shared_path.empty() || size == 0 || source_slot_offset > source_mapping_size ||
-        size > source_mapping_size - source_slot_offset) {
+    if (remote_agent.empty() || pool_epoch == 0 || tx_generation == 0 ||
+        ls_cookie.empty() || ls_path.empty() || size == 0 ||
+        tx_offset > ls_mapping_size || size > ls_mapping_size - tx_offset) {
         status = NIXL_ERR_MISMATCH;
     }
 
     if (status == NIXL_SUCCESS &&
         !validateLocalSharedReady(remote_agent,
-                                  source_region_id,
-                                  source_region_cookie,
-                                  source_shared_path,
-                                  source_slot_id,
-                                  source_slot_offset,
-                                  source_mapping_size,
+                                  pool_epoch,
+                                  ls_cookie,
+                                  ls_path,
+                                  tx_slot_id,
+                                  tx_generation,
+                                  tx_offset,
+                                  ls_mapping_size,
                                   size)) {
         NIXL_ERROR << "UCX local staged READY failed source metadata validation"
                    << " remote_agent=" << remote_agent
                    << " transfer_id=" << transfer_id
                    << " chunk_id=" << chunk_id
-                   << " region_id=" << source_region_id
-                   << " slot_id=" << source_slot_id
-                   << " path=" << source_shared_path;
+                   << " pool_epoch=" << pool_epoch
+                   << " slot_id=" << tx_slot_id
+                   << " path=" << ls_path;
         status = NIXL_ERR_MISMATCH;
     }
 
@@ -3497,12 +3563,13 @@ nixlUcxEngine::handleStagedLocalWriteReady(const nixl_blob_t &message, ucp_ep_h 
             status = NIXL_ERR_BACKEND;
         } else {
             status = getLocalSharedAttachment(remote_agent,
-                                              source_shared_path,
-                                              source_mapping_size,
+                                              pool_epoch,
+                                              ls_path,
+                                              ls_mapping_size,
                                               attachment);
         }
         if (status == NIXL_SUCCESS) {
-            host_addr = static_cast<char *>(attachment->base) + source_slot_offset;
+            host_addr = static_cast<char *>(attachment->base) + tx_offset;
         }
     }
 
@@ -3531,7 +3598,7 @@ nixlUcxEngine::handleStagedLocalWriteReady(const nixl_blob_t &message, ucp_ep_h 
             sendStagedAck(remote_agent,
                           transfer_id,
                           chunk_id,
-                          source_slot_generation,
+                          tx_generation,
                           status,
                           reply_ep);
         if (ack_status != NIXL_SUCCESS && ack_status != NIXL_IN_PROG) {
