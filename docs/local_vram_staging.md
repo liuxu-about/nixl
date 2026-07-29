@@ -174,31 +174,39 @@ Backend parameters:
 
 ```text
 vram_local_staging=true
-local_staging_mode=auto          # auto | shared_pinned | ucx_staged | off
-local_staging_chunk_size=16777216
-local_staging_slots_per_gpu=4
-local_staging_slot_request_window=32
-local_staging_cuda_copy_streams=1
+staging_chunk_size=16777216
+staging_tx_slots_per_gpu=4
+staging_rx_slots_per_gpu=4
+staging_max_grants_per_agent=0
+staging_slot_request_window=32
+staging_cuda_copy_streams=1
 local_staging_shm_dir=/dev/shm/nixl
 local_staging_fallback=true
-local_staging_owner=source        # source | target
-local_staging_host_id=<optional stable host id>
 ```
 
 Environment variables:
 
 ```text
 NIXL_UCX_VRAM_LOCAL_STAGING=1
-NIXL_UCX_LOCAL_STAGING_MODE=auto
-NIXL_UCX_LOCAL_STAGING_CHUNK_SIZE=16777216
-NIXL_UCX_LOCAL_STAGING_SLOTS=4
-NIXL_UCX_LOCAL_STAGING_SLOT_REQUEST_WINDOW=32
-NIXL_UCX_LOCAL_STAGING_CUDA_COPY_STREAMS=1
+NIXL_UCX_STAGING_CHUNK_SIZE=16777216
+NIXL_UCX_STAGING_TX_SLOTS=4
+NIXL_UCX_STAGING_RX_SLOTS=4
+NIXL_UCX_STAGING_MAX_GRANTS_PER_AGENT=0
+NIXL_UCX_STAGING_SLOT_REQUEST_WINDOW=32
+NIXL_UCX_STAGING_CUDA_COPY_STREAMS=1
 NIXL_UCX_LOCAL_STAGING_SHM_DIR=/dev/shm/nixl
 NIXL_UCX_LOCAL_STAGING_FALLBACK=1
-NIXL_UCX_LOCAL_STAGING_OWNER=source
 NIXL_UCX_LOCAL_STAGING_HOST_ID=<optional stable host id>
 ```
+
+Local shared staging uses the TX partition of the same per-GPU slab as remote staging. One
+pool-scoped shared-memory file is created per process/GPU/epoch, and all registered VRAM regions
+refer to that descriptor. The target validates READY messages against the previously loaded remote
+pool descriptor and caches one attachment per `(source agent, pool epoch)`.
+
+The legacy `staging_slots_per_gpu` / `NIXL_UCX_STAGING_SLOTS` shorthand sets both TX and RX counts
+when the direction-specific value is absent. For a source-only or target-only deployment, set the
+unused partition to zero; a disabled required role fails with `NIXL_ERR_NOT_SUPPORTED`.
 
 `NIXL_UCX_VRAM_LOCAL_STAGING=1` now automatically enables UCX VRAM staging if
 `NIXL_UCX_VRAM_STAGING` or `vram_staging` was left off. The backend logs this once during engine
@@ -214,15 +222,14 @@ NIXL_UCX_LOCAL_STAGING_FORCE_ATTACH_FAIL=1
 Set this only on the target process. It forces the local shared READY handler to ACK an attach error
 so the initiator fallback path can be tested deterministically.
 
-`auto` should prefer the shared pinned fast path when all of these are true:
+The backend prefers the shared pinned fast path when all of these are true:
 
 - local and remote metadata report the same host id;
 - the peer process can open and `mmap` the advertised shared staging object;
 - the local CUDA runtime can `cudaHostRegister` the mapped pages;
-- the selected owner mode is compatible with the transfer direction.
+- the source pool has at least one TX slot.
 
-If either check fails, `auto` should fall back to the existing UCX staged path if
-`NIXL_UCX_VRAM_STAGING=1` is also enabled.
+If either check fails, `local_staging_fallback=true` falls back to the UCX staged path.
 
 ## Same-Host Detection
 

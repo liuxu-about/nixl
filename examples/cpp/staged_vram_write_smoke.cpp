@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -32,6 +33,7 @@ struct Args {
     double timeout = 60.0;
     size_t chunkSize = 16 * 1024 * 1024;
     size_t slots = 4;
+    size_t regions = 1;
     size_t concurrency = 1;
     size_t iters = 1;
     size_t offsetStride = 0;
@@ -53,7 +55,7 @@ usage(const char *prog) {
     std::cerr << "Usage: " << prog
               << " --mode target|initiator [--ip target_ip] [--port port]"
               << " [--bytes n] [--timeout seconds] [--chunk-size n]"
-              << " [--slots n] [--concurrency n] [--iters n]"
+              << " [--slots n] [--regions n] [--concurrency n] [--iters n]"
               << " [--offset-stride n] [--descriptors n]"
               << " [--initiator-id n] [--initiator-count n]"
               << " [--poll-sleep-us n] [--progress-delay-us n]"
@@ -88,6 +90,8 @@ parseArgs(int argc, char **argv) {
             args.chunkSize = std::stoull(needValue());
         } else if (key == "--slots") {
             args.slots = std::stoull(needValue());
+        } else if (key == "--regions") {
+            args.regions = std::stoull(needValue());
         } else if (key == "--concurrency") {
             args.concurrency = std::stoull(needValue());
         } else if (key == "--iters") {
@@ -127,10 +131,12 @@ parseArgs(int argc, char **argv) {
     if (args.mode == "initiator" && args.ip.empty()) {
         usage(argv[0]);
     }
-    if (args.bytes == 0 || args.concurrency == 0 || args.iters == 0 ||
-        args.initiatorCount == 0 || args.descriptors == 0 ||
+    if (args.bytes == 0 || args.regions == 0 || args.concurrency == 0 || args.iters == 0 ||
+        args.initiatorCount == 0 || args.slots == 0 || args.descriptors == 0 ||
         args.descriptors > args.bytes ||
-        args.descriptors > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        args.descriptors > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        args.regions >
+            static_cast<size_t>(std::numeric_limits<int>::max()) / args.descriptors) {
         usage(argv[0]);
     }
     if (args.offsetStride != 0 && args.offsetStride < args.bytes) {
@@ -207,6 +213,33 @@ checkedAdd(size_t a, size_t b, const std::string &what) {
         throw std::runtime_error("size overflow while computing " + what);
     }
     return a + b;
+}
+
+std::string
+readProcStatusKiB(const std::string &field) {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind(field, 0) == 0) {
+            const size_t begin = line.find_first_of("0123456789");
+            const size_t end = line.find_first_not_of("0123456789", begin);
+            if (begin != std::string::npos) {
+                return line.substr(begin, end - begin);
+            }
+        }
+    }
+    return "unavailable";
+}
+
+void
+printPoolMemory(const Args &args, const std::string &role) {
+    const size_t poolSlots = checkedAdd(args.slots, args.slots, "TX+RX slot count");
+    const size_t expectedPoolBytes =
+        args.staging ? checkedMul(poolSlots, args.chunkSize, "expected staging pool bytes") : 0;
+    std::cout << role << " pool_memory regions=" << args.regions
+              << " expected_pool_bytes=" << expectedPoolBytes
+              << " vm_pin_kib=" << readProcStatusKiB("VmPin:")
+              << " rss_shmem_kib=" << readProcStatusKiB("RssShmem:") << "\n";
 }
 
 size_t
@@ -358,7 +391,8 @@ createUcxBackend(nixlAgent &agent, const Args &args) {
     check(agent.getPluginParams("UCX", mems, params), "getPluginParams");
     params["vram_staging"] = args.staging ? "true" : "false";
     params["staging_chunk_size"] = std::to_string(args.chunkSize);
-    params["staging_slots_per_gpu"] = std::to_string(args.slots);
+    params["staging_tx_slots_per_gpu"] = std::to_string(args.slots);
+    params["staging_rx_slots_per_gpu"] = std::to_string(args.slots);
     params["staging_force_progress_thread"] = "true";
     if (!args.ucxDevices.empty()) {
         params["ucx_devices"] = args.ucxDevices;
@@ -370,25 +404,31 @@ createUcxBackend(nixlAgent &agent, const Args &args) {
 }
 
 nixl_reg_dlist_t
-makeRegDlist(void *ptr, size_t bytes) {
-    nixlBlobDesc desc;
-    desc.addr = reinterpret_cast<uintptr_t>(ptr);
-    desc.len = bytes;
-    desc.devId = 0;
-
+makeRegDlist(const std::vector<void *> &ptrs, size_t bytes) {
     nixl_reg_dlist_t dlist(VRAM_SEG);
-    dlist.addDesc(desc);
+    for (void *ptr : ptrs) {
+        nixlBlobDesc desc;
+        desc.addr = reinterpret_cast<uintptr_t>(ptr);
+        desc.len = bytes;
+        desc.devId = 0;
+        dlist.addDesc(desc);
+    }
     return dlist;
 }
 
 nixl_xfer_dlist_t
-makeXferDlist(uintptr_t baseAddr, size_t transferOffset, uint64_t devId, const Args &args) {
+makeXferDlist(const std::vector<uintptr_t> &baseAddrs,
+              size_t transferOffset,
+              uint64_t devId,
+              const Args &args) {
     nixl_xfer_dlist_t dlist(VRAM_SEG);
-    for (size_t desc = 0; desc < args.descriptors; ++desc) {
-        const size_t desc_offset = descriptorOffset(args, desc);
-        const size_t desc_len = descriptorLength(args, desc);
-        nixlBasicDesc piece(baseAddr + transferOffset + desc_offset, desc_len, devId);
-        dlist.addDesc(piece);
+    for (const uintptr_t baseAddr : baseAddrs) {
+        for (size_t desc = 0; desc < args.descriptors; ++desc) {
+            const size_t desc_offset = descriptorOffset(args, desc);
+            const size_t desc_len = descriptorLength(args, desc);
+            nixlBasicDesc piece(baseAddr + transferOffset + desc_offset, desc_len, devId);
+            dlist.addDesc(piece);
+        }
     }
     return dlist;
 }
@@ -396,8 +436,9 @@ makeXferDlist(uintptr_t baseAddr, size_t transferOffset, uint64_t devId, const A
 std::vector<int>
 makeDescriptorIndices(const Args &args) {
     std::vector<int> indices;
-    indices.reserve(args.descriptors);
-    for (size_t desc = 0; desc < args.descriptors; ++desc) {
+    const size_t count = checkedMul(args.regions, args.descriptors, "descriptor index count");
+    indices.reserve(count);
+    for (size_t desc = 0; desc < count; ++desc) {
         indices.push_back(static_cast<int>(desc));
     }
     return indices;
@@ -446,13 +487,18 @@ runTarget(const Args &args) {
     const size_t totalBytes = targetRegionBytes(args);
 
     const auto bufferStart = Clock::now();
-    void *dst = allocDeviceBuffer(totalBytes, nullptr);
+    std::vector<void *> dst;
+    dst.reserve(args.regions);
+    for (size_t region = 0; region < args.regions; ++region) {
+        dst.push_back(allocDeviceBuffer(totalBytes, nullptr));
+    }
     const auto bufferEnd = Clock::now();
 
     const auto registerStart = Clock::now();
     nixl_reg_dlist_t reg = makeRegDlist(dst, totalBytes);
     check(agent.registerMem(reg, &extra), "target registerMem");
     const auto registerEnd = Clock::now();
+    printPoolMemory(args, "target");
 
     const auto metadataStart = Clock::now();
     nixl_xfer_dlist_t empty(VRAM_SEG);
@@ -464,10 +510,13 @@ runTarget(const Args &args) {
             args.pollSleepUs);
     }
 
-    nixlBasicDesc dstDesc(reinterpret_cast<uintptr_t>(dst), totalBytes, 0);
-    nixl_blob_t descMsg = std::string("DESC:") + dstDesc.serialize();
     for (const std::string &initiatorName : initiatorNames) {
-        check(agent.genNotif(initiatorName, descMsg, &extra), "target genNotif DESC");
+        for (size_t region = 0; region < dst.size(); ++region) {
+            nixlBasicDesc dstDesc(reinterpret_cast<uintptr_t>(dst[region]), totalBytes, 0);
+            nixl_blob_t descMsg =
+                std::string("DESC:") + std::to_string(region) + ":" + dstDesc.serialize();
+            check(agent.genNotif(initiatorName, descMsg, &extra), "target genNotif DESC");
+        }
     }
     const auto metadataEnd = Clock::now();
     std::cout << "Target descriptors sent to " << initiatorNames.size() << " initiator(s)\n";
@@ -497,33 +546,38 @@ runTarget(const Args &args) {
     const auto waitEnd = Clock::now();
 
     const auto verifyStart = Clock::now();
-    std::vector<unsigned char> got(totalBytes);
-    checkCuda(cudaMemcpy(got.data(), dst, totalBytes, cudaMemcpyDeviceToHost),
-              "target cudaMemcpy device to host");
-    checkCuda(cudaDeviceSynchronize(), "target cudaDeviceSynchronize");
-    for (const uint64_t initiatorId : initiatorIds) {
-        for (size_t transfer = 0; transfer < localCount; ++transfer) {
-            const size_t globalTransfer = globalTransferIndex(args, initiatorId, transfer);
-            const size_t offset = globalTransfer * stride;
-            for (size_t i = 0; i < args.bytes; ++i) {
-                const unsigned char expected = patternByte(i, transfer, initiatorId);
-                if (got[offset + i] != expected) {
-                    throw std::runtime_error("verification mismatch at initiator " +
-                                             std::to_string(initiatorId) + " transfer " +
-                                             std::to_string(transfer) + " byte " +
-                                             std::to_string(i));
+    for (size_t region = 0; region < dst.size(); ++region) {
+        std::vector<unsigned char> got(totalBytes);
+        checkCuda(cudaMemcpy(got.data(), dst[region], totalBytes, cudaMemcpyDeviceToHost),
+                  "target cudaMemcpy device to host");
+        checkCuda(cudaDeviceSynchronize(), "target cudaDeviceSynchronize");
+        for (const uint64_t initiatorId : initiatorIds) {
+            for (size_t transfer = 0; transfer < localCount; ++transfer) {
+                const size_t globalTransfer = globalTransferIndex(args, initiatorId, transfer);
+                const size_t offset = globalTransfer * stride;
+                for (size_t i = 0; i < args.bytes; ++i) {
+                    const unsigned char expected = patternByte(i, transfer, initiatorId);
+                    if (got[offset + i] != expected) {
+                        throw std::runtime_error(
+                            "verification mismatch at region " + std::to_string(region) +
+                            " initiator " + std::to_string(initiatorId) + " transfer " +
+                            std::to_string(transfer) + " byte " + std::to_string(i));
+                    }
                 }
             }
         }
     }
 
     std::cout << "Target verification passed: " << totalCount << " transfers, " << args.bytes
-              << " bytes each, " << initiatorNames.size() << " initiator(s)\n";
+              << " bytes per region, " << args.regions << " region(s), "
+              << initiatorNames.size() << " initiator(s)\n";
     const auto verifyEnd = Clock::now();
 
     const auto cleanupStart = Clock::now();
     check(agent.deregisterMem(reg, &extra), "target deregisterMem");
-    checkCuda(cudaFree(dst), "target cudaFree");
+    for (void *ptr : dst) {
+        checkCuda(cudaFree(ptr), "target cudaFree");
+    }
     const auto cleanupEnd = Clock::now();
 
     printTiming(args, "target", "setup", elapsedUs(setupStart, setupEnd));
@@ -558,13 +612,18 @@ runInitiator(const Args &args) {
 
     const auto bufferStart = Clock::now();
     const auto pattern = makeSourceRegion(args);
-    void *src = allocDeviceBuffer(totalBytes, &pattern);
+    std::vector<void *> src;
+    src.reserve(args.regions);
+    for (size_t region = 0; region < args.regions; ++region) {
+        src.push_back(allocDeviceBuffer(totalBytes, &pattern));
+    }
     const auto bufferEnd = Clock::now();
 
     const auto registerStart = Clock::now();
     nixl_reg_dlist_t reg = makeRegDlist(src, totalBytes);
     check(agent.registerMem(reg, &extra), "initiator registerMem");
     const auto registerEnd = Clock::now();
+    printPoolMemory(args, "initiator");
 
     const auto metadataStart = Clock::now();
     nixl_opt_args_t socket = socketArgs(args, backend);
@@ -577,8 +636,9 @@ runInitiator(const Args &args) {
         args.pollSleepUs);
     check(agent.sendLocalMD(&socket), "sendLocalMD initiator");
 
-    nixlBasicDesc targetDesc;
-    bool haveDesc = false;
+    std::vector<nixlBasicDesc> targetDescs(args.regions);
+    std::vector<bool> haveDescs(args.regions, false);
+    size_t targetDescCount = 0;
     nixl_notifs_t notifs;
     waitUntil(
         [&]() {
@@ -589,20 +649,37 @@ runInitiator(const Args &args) {
             }
             for (const auto &msg : it->second) {
                 if (msg.rfind("DESC:", 0) == 0) {
-                    targetDesc = nixlBasicDesc(msg.substr(5));
-                    haveDesc = true;
-                    return true;
+                    const size_t separator = msg.find(':', 5);
+                    if (separator == std::string::npos) {
+                        continue;
+                    }
+                    const size_t region = std::stoull(msg.substr(5, separator - 5));
+                    if (region >= args.regions || haveDescs[region]) {
+                        continue;
+                    }
+                    targetDescs[region] = nixlBasicDesc(msg.substr(separator + 1));
+                    haveDescs[region] = true;
+                    ++targetDescCount;
                 }
             }
-            return false;
+            return targetDescCount == args.regions;
         },
         "target descriptors",
         args.timeout,
         args.pollSleepUs);
-    if (!haveDesc) {
-        throw std::runtime_error("target descriptor was not received");
+    if (targetDescCount != args.regions) {
+        throw std::runtime_error("not all target descriptors were received");
     }
     const auto metadataEnd = Clock::now();
+
+    std::vector<uintptr_t> localBases;
+    std::vector<uintptr_t> remoteBases;
+    localBases.reserve(args.regions);
+    remoteBases.reserve(args.regions);
+    for (size_t region = 0; region < args.regions; ++region) {
+        localBases.push_back(reinterpret_cast<uintptr_t>(src[region]));
+        remoteBases.push_back(targetDescs[region].addr);
+    }
 
     bool printedBackend = false;
     size_t completedTransfers = 0;
@@ -622,10 +699,9 @@ runInitiator(const Args &args) {
             const size_t remoteOffset =
                 globalTransferIndex(args, args.initiatorId, transfer) * stride;
 
-            nixl_xfer_dlist_t local =
-                makeXferDlist(reinterpret_cast<uintptr_t>(src), localOffset, 0, args);
+            nixl_xfer_dlist_t local = makeXferDlist(localBases, localOffset, 0, args);
             nixl_xfer_dlist_t remote =
-                makeXferDlist(targetDesc.addr, remoteOffset, targetDesc.devId, args);
+                makeXferDlist(remoteBases, remoteOffset, targetDescs[0].devId, args);
 
             nixl_opt_args_t xferExtra = backendOnly(backend);
             xferExtra.notif = kDone;
@@ -700,17 +776,23 @@ runInitiator(const Args &args) {
     const auto transferLoopEnd = Clock::now();
 
     std::cout << "Initiator WRITE completed: " << completedTransfers << " transfers, "
-              << args.bytes << " bytes each, " << args.descriptors
-              << " descriptor(s) each, prepped=" << (args.prepped ? 1 : 0)
+              << args.bytes << " bytes per region, " << args.regions << " region(s), "
+              << args.descriptors << " descriptor(s) per region, prepped="
+              << (args.prepped ? 1 : 0)
               << ", skip_desc_merge=" << (args.skipDescMerge ? 1 : 0) << "\n";
 
     const auto cleanupStart = Clock::now();
     check(agent.invalidateRemoteMD(kTargetAgent), "invalidateRemoteMD");
     check(agent.deregisterMem(reg, &extra), "initiator deregisterMem");
-    checkCuda(cudaFree(src), "initiator cudaFree");
+    for (void *ptr : src) {
+        checkCuda(cudaFree(ptr), "initiator cudaFree");
+    }
     const auto cleanupEnd = Clock::now();
 
-    const size_t totalTransferBytes = checkedMul(completedTransfers, args.bytes, "total bytes");
+    const size_t totalTransferBytes =
+        checkedMul(checkedMul(completedTransfers, args.bytes, "total transfer bytes"),
+                   args.regions,
+                   "total region transfer bytes");
     const double transferSec =
         static_cast<double>(elapsedUs(transferLoopStart, transferLoopEnd)) / 1000000.0;
     if (args.timing && transferSec > 0) {

@@ -88,7 +88,9 @@ Suggested backend parameters:
 ```text
 vram_staging=true
 staging_chunk_size=16777216
-staging_slots_per_gpu=4
+staging_tx_slots_per_gpu=4
+staging_rx_slots_per_gpu=4
+staging_max_grants_per_agent=0
 staging_force_progress_thread=true
 staging_cuda_copy_streams=1
 staging_slot_request_window=32
@@ -103,7 +105,9 @@ Suggested environment variables:
 ```text
 NIXL_UCX_VRAM_STAGING=1
 NIXL_UCX_STAGING_CHUNK_SIZE=16M
-NIXL_UCX_STAGING_SLOTS=4
+NIXL_UCX_STAGING_TX_SLOTS=4
+NIXL_UCX_STAGING_RX_SLOTS=4
+NIXL_UCX_STAGING_MAX_GRANTS_PER_AGENT=0
 NIXL_UCX_STAGING_FORCE_PROGRESS_THREAD=1
 NIXL_UCX_STAGING_CUDA_COPY_STREAMS=1
 NIXL_UCX_STAGING_SLOT_REQUEST_WINDOW=32
@@ -113,6 +117,16 @@ NIXL_UCX_STAGING_SOURCE_D2H_PREFETCH=1
 NIXL_UCX_STAGING_LEASE_TIMEOUT_MS=60000
 ```
 
+The TX and RX counts describe two fixed partitions of one per-process, per-GPU slab. TX slots are
+used only for source D2H staging; RX slots are used only as remote-write landing slots. A value of
+zero disables that role. `staging_max_grants_per_agent=0` selects
+`max(1, staging_rx_slots_per_gpu / 2)` when multiple initiators contend. The legacy
+`staging_slots_per_gpu` / `NIXL_UCX_STAGING_SLOTS` shorthand remains accepted and seeds both
+counts when the direction-specific setting is absent.
+
+`staging_slot_request_window` is shared by all regions for one `(remote agent, GPU, pool epoch)`,
+not allocated once per registered region. Its automatic value is four times the remote RX count.
+
 The existing direct UCX path remains the default. Staged mode is opt-in.
 
 ## Implementation Status
@@ -120,6 +134,12 @@ The existing direct UCX path remains the default. Staged mode is opt-in.
 Current local implementation status:
 
 - Added opt-in staged configuration through UCX backend parameters and environment variables.
+- Uses one shared staging pool per GPU, independent of the number of registered VRAM regions.
+  Registration publishes a monotonic region token and a compact v2 pool descriptor; deregistration
+  removes only the region record and never frees the pool.
+- Partitions each pool into TX and RX slots. RX leases are pool-scoped, stale reservations are
+  quarantined rather than re-granted, and contended initiators are limited by the per-agent grant
+  cap.
 - Added staged `VRAM_SEG` registration that allocates pinned host slots, registers them as
   `DRAM_SEG` with UCX, and publishes staged metadata instead of a direct GPU rkey.
 - Added internal UCX active messages for staged WRITE ready and ACK. These messages are separate
@@ -680,6 +700,7 @@ struct StagedSlotLease {
 The C++ smoke test has been extended with:
 
 ```text
+--regions N
 --concurrency N
 --iters N
 --bytes N
@@ -692,6 +713,11 @@ The C++ smoke test has been extended with:
 --prepped 0|1
 --skip-desc-merge 0|1
 ```
+
+`--regions N` registers N separate VRAM regions on the same GPU and includes every region in each
+WRITE request. Both C++ and Python smokes print `expected_pool_bytes`, `VmPin`, and `RssShmem`
+after registration; increasing N must not change the expected pool size
+`(tx_slots + rx_slots) * chunk_size`.
 
 Observed Phase 3A acceptance matrix on `sglang-rdma-0-26 -> sglang-rdma-0-41`:
 

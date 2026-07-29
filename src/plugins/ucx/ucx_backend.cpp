@@ -3278,7 +3278,6 @@ nixlUcxEngine::handleStagedSlotReq(const nixl_blob_t &message, ucp_ep_h reply_ep
     uint64_t slot_id = 0;
     uint64_t lease_id = 0;
     uint64_t pool_epoch = 0;
-    uint64_t pool_epoch = 0;
     if (remote_agent.empty()) {
         status = NIXL_ERR_MISMATCH;
     }

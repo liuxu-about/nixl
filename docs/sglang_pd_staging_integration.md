@@ -61,7 +61,9 @@ Use these for both single-node and multi-node validation:
 NIXL_PLUGIN_DIR=/path/to/nixl/build/src/plugins/ucx
 LD_LIBRARY_PATH=/path/to/nixl/build/src/core:/path/to/nixl/build/src/infra:/path/to/nixl/build/src/utils/common:/path/to/nixl/build/src/utils/serdes:/path/to/nixl/build/src/utils/stream:/path/to/ucx/lib:/usr/local/cuda/lib64
 NIXL_UCX_STAGING_CHUNK_SIZE=16777216
-NIXL_UCX_STAGING_SLOTS=4
+NIXL_UCX_STAGING_TX_SLOTS=4
+NIXL_UCX_STAGING_RX_SLOTS=4
+NIXL_UCX_STAGING_MAX_GRANTS_PER_AGENT=0
 NIXL_UCX_STAGING_SLOT_REQUEST_WINDOW=32
 NIXL_UCX_STAGING_SOURCE_D2H_PREFETCH=1
 NIXL_UCX_STAGING_FORCE_PROGRESS_THREAD=1
@@ -69,6 +71,16 @@ NIXL_UCX_LOCAL_STAGING_FALLBACK=1
 NIXL_UCX_STAGING_TARGET_H2D_WORKER=0
 NIXL_UCX_STAGING_BATCH_FLUSH=0
 ```
+
+These are per-GPU pool sizes, not per-registration sizes. TX and RX are disjoint partitions;
+`NIXL_UCX_STAGING_SLOT_REQUEST_WINDOW` is shared across all regions for one remote
+agent/GPU/pool epoch. The legacy `NIXL_UCX_STAGING_SLOTS=N` shorthand still means N TX slots plus
+N RX slots.
+
+Low-memory launch scripts that previously set `NIXL_UCX_STAGING_SLOTS=2` must be revisited: it now
+selects two slots per direction for the whole GPU, not two slots per registered region. Prefer
+dropping that override and using role-specific settings (for example TX=4/RX=0 on a pure source
+and TX=0/RX=4 on a pure target).
 
 Enable profile for smoke and shadow runs:
 
@@ -179,12 +191,13 @@ staged_vram_write_smoke \
   --mode target \
   --ip 127.0.0.1 \
   --port <port> \
-  --bytes 16777216 \
+  --bytes 1048576 \
   --concurrency 1 \
   --iters 1 \
   --descriptors 1 \
   --chunk-size 16777216 \
   --slots 4 \
+  --regions 100 \
   --staging 1 \
   --prepped 1 \
   --skip-desc-merge 1 \
@@ -208,8 +221,13 @@ Expected target:
 
 ```text
 Target verification passed
+target pool_memory regions=100 expected_pool_bytes=134217728
 attach_failures = 0
 ```
+
+The expected pool bytes are `(4 TX + 4 RX) * 16 MiB` and must stay the same when `--regions`
+changes. Compare the smoke's `vm_pin_kib` and `rss_shmem_kib` fields before and after increasing
+the region count.
 
 ### Single-Node SGLang Smoke
 
@@ -445,10 +463,9 @@ issues `WRITE`; decode does not necessarily call `add_remote_agent(prefill)`. Th
 therefore must not require a pre-existing target-to-source NIXL connection for internal completion
 messages. `STAGED_SLOT_REQ`, `STAGED_WRITE_READY`, and `STAGED_LOCAL_WRITE_READY` are sent with
 `UCP_AM_SEND_FLAG_REPLY`, and the target replies to `SLOT_GRANT` or `ACK` through the UCX
-`reply_ep` when present. For local shared READY, if source metadata was not preloaded on target,
-the backend uses a restricted READY-carried validation: the path must be under
-`NIXL_UCX_LOCAL_STAGING_SHM_DIR`, contain the source agent, region id, and region cookie when
-present, and match the expected chunk slot offset and size bounds.
+`reply_ep` when present. A local shared READY is accepted only after the target has loaded the
+source's v2 metadata. Validation uses the cached remote pool entry: agent, pool epoch, shared path,
+cookie, mapping size, TX slot id/generation, computed offset, and size must all match.
 
 ## Multi-Node PD
 
@@ -471,7 +488,8 @@ Use these on both hosts:
 NIXL_UCX_VRAM_STAGING=1
 NIXL_UCX_STAGING_SOURCE_D2H_PREFETCH=1
 NIXL_UCX_STAGING_CHUNK_SIZE=16777216
-NIXL_UCX_STAGING_SLOTS=4
+NIXL_UCX_STAGING_TX_SLOTS=4
+NIXL_UCX_STAGING_RX_SLOTS=4
 NIXL_UCX_STAGING_SLOT_REQUEST_WINDOW=32
 NIXL_UCX_STAGING_FORCE_PROGRESS_THREAD=1
 NIXL_UCX_LOCAL_STAGING_FALLBACK=1
@@ -600,7 +618,8 @@ NIXL_UCX_VRAM_STAGING=1
 NIXL_UCX_VRAM_LOCAL_STAGING=0
 NIXL_UCX_STAGING_SOURCE_D2H_PREFETCH=1
 NIXL_UCX_STAGING_CHUNK_SIZE=16777216
-NIXL_UCX_STAGING_SLOTS=4
+NIXL_UCX_STAGING_TX_SLOTS=4
+NIXL_UCX_STAGING_RX_SLOTS=4
 NIXL_UCX_STAGING_SLOT_REQUEST_WINDOW=32
 NIXL_UCX_STAGING_TARGET_H2D_WORKER=0
 NIXL_UCX_STAGING_BATCH_FLUSH=0
@@ -752,7 +771,8 @@ NIXL_UCX_VRAM_STAGING=1
 NIXL_UCX_VRAM_LOCAL_STAGING=0
 NIXL_UCX_STAGING_SOURCE_D2H_PREFETCH=1
 NIXL_UCX_STAGING_CHUNK_SIZE=16777216
-NIXL_UCX_STAGING_SLOTS=4
+NIXL_UCX_STAGING_TX_SLOTS=4
+NIXL_UCX_STAGING_RX_SLOTS=4
 NIXL_UCX_STAGING_SLOT_REQUEST_WINDOW=32
 ```
 
@@ -819,7 +839,8 @@ NIXL_UCX_VRAM_STAGING=1
 NIXL_UCX_VRAM_LOCAL_STAGING=0
 NIXL_UCX_STAGING_SOURCE_D2H_PREFETCH=1
 NIXL_UCX_STAGING_CHUNK_SIZE=16777216
-NIXL_UCX_STAGING_SLOTS=4
+NIXL_UCX_STAGING_TX_SLOTS=4
+NIXL_UCX_STAGING_RX_SLOTS=4
 NIXL_UCX_STAGING_SLOT_REQUEST_WINDOW=32
 ```
 
