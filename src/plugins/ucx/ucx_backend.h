@@ -28,8 +28,10 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <map>
 #include <poll.h>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 
 #include "nixl.h"
@@ -41,6 +43,9 @@
 #include "rkey.h"
 #include "ucx_enums.h"
 #include "ucx_utils.h"
+
+class nixlUcxStagedSlotPool;
+struct nixlUcxStagedRemotePool;
 
 class nixlUcxConnection : public nixlBackendConnMD {
     private:
@@ -217,8 +222,6 @@ protected:
         size_t txSlots = 4;
         size_t rxSlots = 4;
         size_t maxGrantsPerAgent = 0;
-        // Transitional v1 path field; removed when shared pools are wired.
-        size_t slotsPerGpu = 4;
         bool forceProgressThread = true;
         size_t cudaCopyStreams = 1;
         size_t slotRequestWindow = 0;
@@ -319,8 +322,8 @@ private:
                              uint64_t lease_id,
                              nixl_status_t status) const;
 
-    void
-    registerStagedRegion(nixlBackendMD *metadata);
+    nixl_status_t
+    ensureStagedPool(uint64_t gpu_dev, nixlUcxStagedSlotPool *&pool);
 
     nixl_status_t
     postStagedWrite(const nixl_meta_dlist_t &local,
@@ -348,6 +351,7 @@ private:
                         uint64_t chunk_id,
                         uint64_t slot_id,
                         uint64_t lease_id,
+                        uint64_t pool_epoch,
                         nixl_status_t status,
                         ucp_ep_h reply_ep = nullptr) const;
 
@@ -417,7 +421,7 @@ private:
     handleStagedLocalWriteReady(const nixl_blob_t &message, ucp_ep_h reply_ep = nullptr) const;
 
     struct StagedH2DTask {
-        nixlBackendMD *region = nullptr;
+        nixlUcxStagedSlotPool *pool = nullptr;
         void *hostAddr = nullptr;
         std::string remoteAgent;
         ucp_ep_h replyEp = nullptr;
@@ -425,6 +429,7 @@ private:
         uint64_t chunkId = 0;
         uint64_t slotId = 0;
         uint64_t leaseId = 0;
+        uint64_t regionToken = 0;
         uintptr_t gpuAddr = 0;
         uint64_t gpuDev = 0;
         size_t size = 0;
@@ -596,8 +601,13 @@ private:
     mutable std::atomic<uint64_t> nextStagedTransferId_;
     mutable std::mutex stagedReqMutex_;
     mutable std::unordered_map<uint64_t, nixlBackendReqH *> pendingStagedReqs_;
+    // Lock order: stagedRegionMutex_ -> pool mutex. stagedPoolMutex_ only
+    // protects map lookup/insertion and is never held while calling a pool.
     mutable std::mutex stagedRegionMutex_;
-    std::vector<nixlBackendMD *> stagedRegions_;
+    std::unordered_map<uint64_t, nixlBackendMD *> stagedRegionsByToken_;
+    mutable std::mutex stagedPoolMutex_;
+    std::map<uint64_t, std::unique_ptr<nixlUcxStagedSlotPool>> stagedPools_;
+    mutable std::atomic<uint64_t> nextRegionToken_{1};
     mutable std::atomic<uint64_t> stagedProfileTargetReadyCount_{0};
     mutable std::atomic<uint64_t> stagedProfileTargetBytes_{0};
     mutable std::atomic<uint64_t> stagedProfileTargetH2DUs_{0};

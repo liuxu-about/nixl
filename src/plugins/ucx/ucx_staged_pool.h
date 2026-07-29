@@ -66,6 +66,7 @@ public:
         bool unlinkSharedPath = false;
         void *txRegistration = nullptr;
         void *rxRegistration = nullptr;
+        std::string rxRkey;
     };
 
     using NowUs = std::function<uint64_t()>;
@@ -109,7 +110,6 @@ public:
     beginRemoteH2D(const std::string &owner_agent,
                    uint64_t transfer_id,
                    uint64_t chunk_id,
-                   uint64_t region_token,
                    uint64_t slot_id,
                    uint64_t lease_id,
                    uintptr_t gpu_addr,

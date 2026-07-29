@@ -63,13 +63,11 @@ protected:
           const std::string &owner,
           uint64_t transfer,
           uint64_t chunk,
-          uint64_t token,
           const nixlUcxStagedSlotGrant &grant) {
         nixlUcxStagedReadyLease ready;
         return pool.beginRemoteH2D(owner,
                                    transfer,
                                    chunk,
-                                   token,
                                    grant.slotId,
                                    grant.leaseId,
                                    0x1000,
@@ -116,8 +114,8 @@ TEST_F(StagedPoolTest, LateMatchingReadySettlesQuarantinedLease) {
     nowUs_ += 11;
     EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_IN_PROG);
 
-    EXPECT_EQ(begin(*pool, "peer", 1, 1, 12, grant), NIXL_ERR_MISMATCH);
-    EXPECT_EQ(begin(*pool, "peer", 1, 1, 11, grant), NIXL_SUCCESS);
+    EXPECT_EQ(begin(*pool, "other", 1, 1, grant), NIXL_ERR_MISMATCH);
+    EXPECT_EQ(begin(*pool, "peer", 1, 1, grant), NIXL_SUCCESS);
     pool->finishRemoteLease(grant.slotId, grant.leaseId, NIXL_SUCCESS);
     EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_SUCCESS);
 }
@@ -139,7 +137,7 @@ TEST_F(StagedPoolTest, OwnerReleaseSkipsH2DAndOtherOwners) {
     const auto a_h2d = reserve(*pool, "a", 1, 2);
     const auto b_first = reserve(*pool, "b", 2, 1);
     const auto b_second = reserve(*pool, "b", 2, 2);
-    ASSERT_EQ(begin(*pool, "a", 1, 2, 7, a_h2d), NIXL_SUCCESS);
+    ASSERT_EQ(begin(*pool, "a", 1, 2, a_h2d), NIXL_SUCCESS);
     nowUs_ += 11;
     EXPECT_EQ(reserve(*pool, "c", 3, 1).status, NIXL_IN_PROG);
 
@@ -153,7 +151,7 @@ TEST_F(StagedPoolTest, OwnerReleaseSkipsH2DAndOtherOwners) {
 TEST_F(StagedPoolTest, ErrorLeaseIsReclaimedUnderPressure) {
     auto pool = makePool(1, 1);
     const auto grant = reserve(*pool, "a", 1, 1);
-    ASSERT_EQ(begin(*pool, "a", 1, 1, 7, grant), NIXL_SUCCESS);
+    ASSERT_EQ(begin(*pool, "a", 1, 1, grant), NIXL_SUCCESS);
     pool->finishRemoteLease(grant.slotId, grant.leaseId, NIXL_ERR_BACKEND);
     ASSERT_EQ(pool->rxState(grant.slotId), nixlUcxStagedSlotState::ERROR);
 
@@ -173,7 +171,7 @@ TEST_F(StagedPoolTest, PerAgentCapAppliesOnlyWhenAnotherAgentIsActive) {
     ASSERT_EQ(b.status, NIXL_SUCCESS);
     EXPECT_EQ(reserve(*pool, "a", 1, 3).status, NIXL_IN_PROG);
 
-    ASSERT_EQ(begin(*pool, "b", 2, 1, 7, b), NIXL_SUCCESS);
+    ASSERT_EQ(begin(*pool, "b", 2, 1, b), NIXL_SUCCESS);
     pool->finishRemoteLease(b.slotId, b.leaseId, NIXL_SUCCESS);
     EXPECT_EQ(reserve(*pool, "a", 1, 3).status, NIXL_SUCCESS);
 }
@@ -193,7 +191,7 @@ TEST_F(StagedPoolTest, TokenBookkeepingSurvivesReserveBeginAndQuarantine) {
     ASSERT_TRUE(pool->hasLeasesForToken(41));
     ASSERT_TRUE(pool->hasLeasesForToken(42));
     EXPECT_EQ(pool->rxRegionToken(h2d.slotId), 41u);
-    ASSERT_EQ(begin(*pool, "a", 1, 1, 41, h2d), NIXL_SUCCESS);
+    ASSERT_EQ(begin(*pool, "a", 1, 1, h2d), NIXL_SUCCESS);
     EXPECT_TRUE(pool->hasLeasesForToken(41));
 
     nowUs_ += 11;

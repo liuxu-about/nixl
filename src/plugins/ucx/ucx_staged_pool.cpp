@@ -223,7 +223,6 @@ nixl_status_t
 nixlUcxStagedSlotPool::beginRemoteH2D(const std::string &owner_agent,
                                       uint64_t transfer_id,
                                       uint64_t chunk_id,
-                                      uint64_t region_token,
                                       uint64_t slot_id,
                                       uint64_t lease_id,
                                       uintptr_t gpu_addr,
@@ -240,8 +239,7 @@ nixlUcxStagedSlotPool::beginRemoteH2D(const std::string &owner_agent,
          lease.state != nixlUcxStagedSlotState::QUARANTINED) ||
         lease.ownerAgent != owner_agent || lease.transferId != transfer_id ||
         lease.chunkId != chunk_id || lease.leaseId != lease_id ||
-        lease.regionToken != region_token || lease.gpuAddr != gpu_addr ||
-        lease.gpuDev != gpu_dev || lease.size != size) {
+        lease.gpuAddr != gpu_addr || lease.gpuDev != gpu_dev || lease.size != size) {
         return NIXL_ERR_MISMATCH;
     }
 
