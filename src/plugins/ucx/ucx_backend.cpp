@@ -1660,7 +1660,72 @@ tlsSharedWorkerMap() {
 // Through parent destructor the unregister will be called.
 nixlUcxEngine::~nixlUcxEngine() {
     stopStagedH2DWorker();
+
+    {
+        const std::lock_guard lock(remotePoolMutex_);
+        remotePools_.clear();
+    }
     cleanupLocalSharedAttachments();
+    {
+        const std::unique_lock lock(remoteConnMapMutex_);
+        remoteConnMap.clear();
+    }
+
+    {
+        const std::lock_guard lock(stagedRegionMutex_);
+        if (!stagedRegionsByToken_.empty()) {
+            NIXL_WARN << "Destroying UCX engine with " << stagedRegionsByToken_.size()
+                      << " staged region registration(s) still present";
+        }
+        stagedRegionsByToken_.clear();
+    }
+
+    std::map<uint64_t, std::unique_ptr<nixlUcxStagedSlotPool>> pools;
+    {
+        const std::lock_guard lock(stagedPoolMutex_);
+        pools.swap(stagedPools_);
+    }
+    for (auto &[gpu_dev, pool] : pools) {
+        if (pool->hasActiveWork()) {
+            NIXL_WARN << "Destroying UCX staged pool with active work gpu_dev=" << gpu_dev
+                      << " pool_epoch=" << pool->poolEpoch;
+        }
+
+        auto &backing = pool->backing;
+        if (backing.rxRegistration != nullptr) {
+            auto *mem = static_cast<nixlUcxMem *>(backing.rxRegistration);
+            uc->memDereg(*mem);
+            delete mem;
+            backing.rxRegistration = nullptr;
+        }
+        if (backing.txRegistration != nullptr) {
+            auto *mem = static_cast<nixlUcxMem *>(backing.txRegistration);
+            uc->memDereg(*mem);
+            delete mem;
+            backing.txRegistration = nullptr;
+        }
+        if (backing.base != nullptr) {
+            if (backing.localShared) {
+                if (backing.hostRegistered) {
+                    cudaHostUnregister(backing.base);
+                    backing.hostRegistered = false;
+                }
+                munmap(backing.base, backing.mappingSize);
+            } else {
+                cudaFreeHost(backing.base);
+            }
+            backing.base = nullptr;
+        }
+        if (backing.sharedFd >= 0) {
+            close(backing.sharedFd);
+            backing.sharedFd = -1;
+        }
+        if (backing.unlinkSharedPath && !backing.sharedPath.empty()) {
+            unlink(backing.sharedPath.c_str());
+            backing.unlinkSharedPath = false;
+        }
+    }
+
     tlsSharedWorkerMap().erase(this);
 }
 
@@ -2235,18 +2300,34 @@ nixl_status_t nixlUcxEngine::disconnect(const std::string &remote_agent) {
                   << remote_agent << " on disconnect";
     }
 
+    size_t evicted_pools = 0;
+    {
+        const std::lock_guard lock(remotePoolMutex_);
+        for (auto it = remotePools_.begin(); it != remotePools_.end();) {
+            if (std::get<0>(it->first) == remote_agent) {
+                it = remotePools_.erase(it);
+                ++evicted_pools;
+            } else {
+                ++it;
+            }
+        }
+    }
+    cleanupLocalSharedAttachmentsForAgent(remote_agent);
+    if (evicted_pools != 0) {
+        NIXL_INFO << "Evicted " << evicted_pools << " UCX staged remote pool descriptor(s) for "
+                  << remote_agent << " on disconnect";
+    }
+
+    bool connection_found = false;
     {
         const std::unique_lock lock(remoteConnMapMutex_);
         const auto it = remoteConnMap.find(remote_agent);
-
-        if (it == remoteConnMap.end()) {
-            return NIXL_ERR_NOT_FOUND;
+        if (it != remoteConnMap.end()) {
+            remoteConnMap.erase(it);
+            connection_found = true;
         }
-
-        remoteConnMap.erase(it);
     }
-    cleanupLocalSharedAttachmentsForAgent(remote_agent);
-    return NIXL_SUCCESS;
+    return connection_found ? NIXL_SUCCESS : NIXL_ERR_NOT_FOUND;
 }
 
 nixl_status_t nixlUcxEngine::loadRemoteConnInfo (const std::string &remote_agent,
@@ -2462,6 +2543,16 @@ nixlUcxEngine::ensureStagedPool(uint64_t gpu_dev, nixlUcxStagedSlotPool *&pool) 
                       << " transfer_id=" << transfer_id << " chunk_id=" << chunk_id
                       << " lease_id=" << lease_id;
         });
+    NIXL_INFO << "Created UCX staged pool gpu_dev=" << gpu_dev
+              << " pool_epoch=" << created->poolEpoch
+              << " tx_slots=" << created->txCount
+              << " rx_slots=" << created->rxCount
+              << " slot_size=" << created->slotSize
+              << " slot_stride=" << created->slotStride
+              << " max_grants_per_agent=" << created->maxGrantsPerAgent
+              << " bytes=" << created->backing.mappingSize
+              << " local_shared=" << created->backing.localShared
+              << " shared_path=" << created->backing.sharedPath;
     pool = created.get();
     stagedPools_.emplace(gpu_dev, std::move(created));
     return NIXL_SUCCESS;
@@ -2473,7 +2564,7 @@ nixl_status_t nixlUcxEngine::registerMem (const nixlBlobDesc &mem,
 {
     if (vramStagingEnabled() && nixl_mem == VRAM_SEG) {
         if (mem.len == 0 || vramStagingConfig_.chunkSize == 0 ||
-            vramStagingConfig_.txSlots + vramStagingConfig_.rxSlots == 0) {
+            (vramStagingConfig_.txSlots == 0 && vramStagingConfig_.rxSlots == 0)) {
             NIXL_ERROR << "Invalid UCX VRAM staging configuration: chunk_size="
                        << vramStagingConfig_.chunkSize
                        << " tx_slots=" << vramStagingConfig_.txSlots
