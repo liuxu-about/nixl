@@ -42,6 +42,9 @@ get_ucx_backend_common_options() {
     params.emplace(nixl_ucx_vram_staging_param_name, "false");
     params.emplace(nixl_ucx_staging_chunk_size_param_name, std::to_string(16 * 1024 * 1024));
     params.emplace(nixl_ucx_staging_slots_param_name, "4");
+    params.emplace(nixl_ucx_staging_tx_slots_param_name, "4");
+    params.emplace(nixl_ucx_staging_rx_slots_param_name, "4");
+    params.emplace(nixl_ucx_staging_max_grants_param_name, "0");
     params.emplace(nixl_ucx_staging_force_progress_param_name, "true");
     params.emplace(nixl_ucx_staging_cuda_streams_param_name, "1");
     params.emplace(nixl_ucx_staging_slot_window_param_name, "0");
@@ -142,6 +145,11 @@ nixl_env_get_bool(std::string_view name, bool default_value) {
 nixl_env_get_size(std::string_view name, size_t default_value) {
     const auto value = nixl::config::internal::getenvOptional(std::string(name));
     return value ? parseSize(*value, default_value) : default_value;
+}
+
+[[nodiscard]] bool
+nixl_env_is_set(std::string_view name) {
+    return nixl::config::internal::getenvOptional(std::string(name)).has_value();
 }
 
 [[nodiscard]] std::string_view

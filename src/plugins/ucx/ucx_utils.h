@@ -35,6 +35,12 @@ inline constexpr std::string_view nixl_ucx_err_handling_param_name = "ucx_error_
 inline constexpr std::string_view nixl_ucx_vram_staging_param_name = "vram_staging";
 inline constexpr std::string_view nixl_ucx_staging_chunk_size_param_name = "staging_chunk_size";
 inline constexpr std::string_view nixl_ucx_staging_slots_param_name = "staging_slots_per_gpu";
+inline constexpr std::string_view nixl_ucx_staging_tx_slots_param_name =
+    "staging_tx_slots_per_gpu";
+inline constexpr std::string_view nixl_ucx_staging_rx_slots_param_name =
+    "staging_rx_slots_per_gpu";
+inline constexpr std::string_view nixl_ucx_staging_max_grants_param_name =
+    "staging_max_grants_per_agent";
 inline constexpr std::string_view nixl_ucx_staging_force_progress_param_name =
     "staging_force_progress_thread";
 inline constexpr std::string_view nixl_ucx_staging_cuda_streams_param_name =
@@ -58,6 +64,12 @@ inline constexpr std::string_view nixl_ucx_vram_staging_env_name = "NIXL_UCX_VRA
 inline constexpr std::string_view nixl_ucx_staging_chunk_size_env_name =
     "NIXL_UCX_STAGING_CHUNK_SIZE";
 inline constexpr std::string_view nixl_ucx_staging_slots_env_name = "NIXL_UCX_STAGING_SLOTS";
+inline constexpr std::string_view nixl_ucx_staging_tx_slots_env_name =
+    "NIXL_UCX_STAGING_TX_SLOTS";
+inline constexpr std::string_view nixl_ucx_staging_rx_slots_env_name =
+    "NIXL_UCX_STAGING_RX_SLOTS";
+inline constexpr std::string_view nixl_ucx_staging_max_grants_env_name =
+    "NIXL_UCX_STAGING_MAX_GRANTS_PER_AGENT";
 inline constexpr std::string_view nixl_ucx_staging_force_progress_env_name =
     "NIXL_UCX_STAGING_FORCE_PROGRESS_THREAD";
 inline constexpr std::string_view nixl_ucx_staging_cuda_streams_env_name =
@@ -118,6 +130,9 @@ nixl_env_get_bool(std::string_view name, bool default_value);
 
 [[nodiscard]] size_t
 nixl_env_get_size(std::string_view name, size_t default_value);
+
+[[nodiscard]] bool
+nixl_env_is_set(std::string_view name);
 
 using nixlUcxReq = void *;
 

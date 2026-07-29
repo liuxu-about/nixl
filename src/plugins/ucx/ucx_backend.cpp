@@ -1718,8 +1718,15 @@ nixlUcxEngine::makeVramStagingConfig(const nixl_b_params_t *custom_params) {
         custom_params, nixl_ucx_vram_staging_param_name, config.enabled);
     config.chunkSize = nixl_b_params_get_size(
         custom_params, nixl_ucx_staging_chunk_size_param_name, config.chunkSize);
-    config.slotsPerGpu =
-        nixl_b_params_get_size(custom_params, nixl_ucx_staging_slots_param_name, config.slotsPerGpu);
+    const size_t legacy_slots = nixl_b_params_get_size(
+        custom_params, nixl_ucx_staging_slots_param_name, config.txSlots);
+    config.slotsPerGpu = legacy_slots;
+    config.txSlots = nixl_b_params_get_size(
+        custom_params, nixl_ucx_staging_tx_slots_param_name, legacy_slots);
+    config.rxSlots = nixl_b_params_get_size(
+        custom_params, nixl_ucx_staging_rx_slots_param_name, legacy_slots);
+    config.maxGrantsPerAgent = nixl_b_params_get_size(
+        custom_params, nixl_ucx_staging_max_grants_param_name, config.maxGrantsPerAgent);
     config.forceProgressThread = nixl_b_params_get_bool(custom_params,
                                                         nixl_ucx_staging_force_progress_param_name,
                                                         config.forceProgressThread);
@@ -1751,7 +1758,19 @@ nixlUcxEngine::makeVramStagingConfig(const nixl_b_params_t *custom_params) {
     }
     config.enabled = nixl_env_get_bool(nixl_ucx_vram_staging_env_name, config.enabled);
     config.chunkSize = nixl_env_get_size(nixl_ucx_staging_chunk_size_env_name, config.chunkSize);
-    config.slotsPerGpu = nixl_env_get_size(nixl_ucx_staging_slots_env_name, config.slotsPerGpu);
+    if (nixl_env_is_set(nixl_ucx_staging_slots_env_name)) {
+        const size_t legacy_env_slots =
+            nixl_env_get_size(nixl_ucx_staging_slots_env_name, config.txSlots);
+        config.slotsPerGpu = legacy_env_slots;
+        config.txSlots = legacy_env_slots;
+        config.rxSlots = legacy_env_slots;
+    }
+    config.txSlots =
+        nixl_env_get_size(nixl_ucx_staging_tx_slots_env_name, config.txSlots);
+    config.rxSlots =
+        nixl_env_get_size(nixl_ucx_staging_rx_slots_env_name, config.rxSlots);
+    config.maxGrantsPerAgent =
+        nixl_env_get_size(nixl_ucx_staging_max_grants_env_name, config.maxGrantsPerAgent);
     config.forceProgressThread =
         nixl_env_get_bool(nixl_ucx_staging_force_progress_env_name, config.forceProgressThread);
     config.cudaCopyStreams =

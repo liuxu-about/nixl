@@ -214,6 +214,10 @@ protected:
     struct VramStagingConfig {
         bool enabled = false;
         size_t chunkSize = 16 * 1024 * 1024;
+        size_t txSlots = 4;
+        size_t rxSlots = 4;
+        size_t maxGrantsPerAgent = 0;
+        // Transitional v1 path field; removed when shared pools are wired.
         size_t slotsPerGpu = 4;
         bool forceProgressThread = true;
         size_t cudaCopyStreams = 1;
