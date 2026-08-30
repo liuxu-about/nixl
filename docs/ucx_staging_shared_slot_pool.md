@@ -254,14 +254,10 @@ timed-out leases stop being re-granted:
 
 - On timeout, a `REMOTE_RESERVED` lease moves to `QUARANTINED`: not grantable, but the lease
   record stays intact.
-- A quarantined lease leaves quarantine only by: (1) the owner settling it after all — a late
-  WRITE_READY with matching lease fields proceeds normally (nothing else was granted the slot,
-  the data is fine) and a late SLOT_RELEASE frees it; (2) owner disconnect —
-  `releaseRemoteLeasesForOwner` frees that agent's quarantined leases, inheriting the same
-  assumption the current disconnect path already makes; or (3) pool rebuild: reallocate the RX
-  registration and bump `poolEpoch`, which invalidates the old rkey wholesale and is the only
-  full close of the late-write window. Rebuild is the recovery of last resort, e.g. when
-  quarantined slots exceed a threshold with the owner still connected.
+- A quarantined lease never returns to the live pool. Late WRITE_READY and SLOT_RELEASE messages
+  cannot revive or free it, and owner disconnect quarantines remaining reserved leases. Process
+  restart or a future pool rebuild is the recovery boundary; this deliberately trades capacity
+  for protection against a late write reaching a newly assigned request.
 - `ERROR` leases (H2D failed) are different: READY was already received, so the RDMA write has
   completed and no remote writer is outstanding. They return to FREE once the error ACK settles,
   as today.
@@ -391,8 +387,8 @@ All in `src/plugins/ucx/`:
   - `postStagedWrite` chunk FSM — TX slots from the pool; computed remote addresses from the
     RemotePool descriptor; window scope change; epoch check on grants.
   - `StagedH2DTask` / H2D worker — drop region pointer.
-  - Disconnect path — pool-scoped `releaseRemoteLeasesForOwner` including quarantined leases;
-    RemotePool cache eviction.
+  - Disconnect path — pool-scoped quarantine of the owner's reserved leases; RemotePool cache
+    eviction.
 - `ucx_utils.h/.cpp` — new param/env names (`tx`/`rx`/`max_grants_per_agent`), legacy shorthand.
 - Docs: update `ucx_vram_staging.md`, `local_vram_staging.md`, SGLang runbook (slot semantics,
   window semantics, lowmem script note).

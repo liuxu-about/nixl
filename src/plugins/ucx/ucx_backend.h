@@ -228,8 +228,8 @@ protected:
         bool batchFlush = false;
         bool targetH2DWorker = false;
         bool sourceD2HPrefetch = false;
-        // Reclaim REMOTE_RESERVED leases older than this when no free slot is left
-        // (dead-initiator backstop). 0 disables reclaim. The budget must cover the
+        // Quarantine REMOTE_RESERVED leases older than this when no free slot is left
+        // (dead-initiator backstop). 0 disables the timeout. The budget must cover the
         // whole grant -> READY span (local slot wait, D2H, RDMA, flush), all driven
         // by application polling. The initiator refuses to use a grant once half of
         // this budget has elapsed since its SLOT_REQ was posted (stale-grant guard),

@@ -108,14 +108,14 @@ diffs minimal and flag anything non-mechanical):
     grant to agent X when X currently holds >= cap RX leases (RESERVED+H2D+QUARANTINED
     combined) AND at least one other agent currently holds >= 1 RX lease. With a single active
     agent the cap is not enforced.
-- `beginRemoteH2D(...)` — as today, but also accept a lease in `QUARANTINED` state when every
-  identity field matches (late-but-alive initiator; the data path is still valid because the
-  slot was never re-granted). On success state -> `REMOTE_H2D` as usual.
+- `beginRemoteH2D(...)` — accepts only `REMOTE_RESERVED`; a quarantined lease cannot be revived.
+  On success state -> `REMOTE_H2D` as usual.
 - `finishRemoteLease(slot_id, lease_id, status)` — unchanged semantics (SUCCESS -> FREE,
   failure -> ERROR).
-- `releaseRemoteLease(...)` — as today, additionally matching leases in `QUARANTINED` state.
-- `releaseLeasesForOwner(owner)` — from `releaseRemoteLeasesForOwner`; also frees that owner's
-  `QUARANTINED` leases. Never touches `REMOTE_H2D`.
+- `quarantineRemoteLease(...)` — a matching SLOT_RELEASE moves `REMOTE_RESERVED` to
+  `QUARANTINED`; an already quarantined matching lease is an idempotent success.
+- `quarantineLeasesForOwner(owner)` — disconnect moves that owner's `REMOTE_RESERVED` leases to
+  `QUARANTINED`. It never touches `REMOTE_H2D` or another owner.
 - `hasLeasesForToken(region_token)` — any RX lease (any non-FREE state) recording that token;
   used by `deregisterMem`.
 - `hasActiveWork()` — any TX slot non-FREE or RX lease non-FREE; used at engine teardown for a
@@ -326,8 +326,7 @@ dereferenced after grant time. Pools outlive the H2D worker (teardown order in �
 
 ### 6.3 Disconnect path
 
-Where `releaseRemoteLeasesForOwner` is called today per region: call
-`pool->releaseLeasesForOwner(agent)` for every pool, and under `remotePoolMutex_` erase that
+Call `pool->quarantineLeasesForOwner(agent)` for every pool, and under `remotePoolMutex_` erase that
 agent's `remotePools_` entries.
 
 ## 7. Tests (phase-1 priority, not an afterthought)
@@ -351,12 +350,10 @@ Cases (assert exact statuses, not just "doesn't crash"):
    time-source injectable — prefer an injectable `now_us` functor, NOTE if you deviate),
    `reserveRxSlot` -> the expired leases become QUARANTINED and the call still returns IN_PROG
    (never a grant of a quarantined slot).
-3. Late settle: quarantined lease + matching `beginRemoteH2D` succeeds -> `finishRemoteLease`
-   SUCCESS -> slot FREE and re-grantable. Mismatched identity on a quarantined lease is
-   rejected.
-4. Late release: `releaseRemoteLease` on a quarantined lease frees it.
-5. Owner release: `releaseLeasesForOwner` frees RESERVED + QUARANTINED of that owner only,
-   never REMOTE_H2D, never other owners'.
+3. Late settle: quarantined lease + matching `beginRemoteH2D` is rejected and remains pinned.
+4. Late release: SLOT_RELEASE cannot free a quarantined lease.
+5. Owner disconnect: reserved leases for that owner become quarantined; never touch
+   REMOTE_H2D or another owner's leases.
 6. ERROR reclaim: ERROR lease -> next `reserveRxSlot` under pressure frees and re-grants it.
 7. Per-agent cap: rx=4, cap auto=2; agent A takes 2, agent B takes 1; A's third request ->
    IN_PROG while B holds; after B settles and A is sole active agent, A can exceed cap.

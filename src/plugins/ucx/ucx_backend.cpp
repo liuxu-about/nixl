@@ -652,6 +652,9 @@ struct nixlUcxStagedChunk {
     nixlUcxStagedPublicMetadata *remoteMetadata = nullptr;
     size_t localSlotId = 0;
     bool localSlotHeld = false;
+    // Set once the host slot may be observed by a remote RDMA/shared-memory
+    // reader.  It is cleared only after transport completion or the target ACK.
+    bool sourceSlotUnsafe = false;
     uint64_t remoteSlotId = 0;
     // Written by markGrant (progress thread) and by the local-ready/fallback paths
     // (app thread), read by markAck (progress thread): must be atomic.
@@ -731,7 +734,15 @@ public:
 
     void
     releaseChunkSlots(nixlUcxStagedChunk &chunk) {
-        releaseLocalSlot(chunk);
+        if (chunk.sourceSlotUnsafe && chunk.localPool && chunk.localSlotHeld) {
+            NIXL_WARN << "Quarantining UCX staged TX slot after ambiguous transfer "
+                      << "transfer_id=" << transferId << " chunk_id=" << chunk.id
+                      << " slot_id=" << chunk.localSlotId;
+            chunk.localPool->quarantineTxSlot(chunk.localSlotId);
+            chunk.localSlotHeld = false;
+        } else {
+            releaseLocalSlot(chunk);
+        }
         releaseRemoteSlot(chunk);
     }
 
@@ -811,7 +822,6 @@ public:
 
     void
     release() override {
-        releaseAllChunkSlots();
         for (const auto &chunk : chunks) {
             if (chunk->req) {
                 chunk->req->release();
@@ -827,6 +837,9 @@ public:
         }
         flushBatches.clear();
         openFlushBatch.reset();
+        // Cancel/release UCX handles before deciding whether their source slot
+        // can be reused.  Ambiguous data-plane operations keep the slot pinned.
+        releaseAllChunkSlots();
         for (auto &[gpu_dev, d2h_streams] : sourceD2HStreams) {
             int previous_device = -1;
             const nixl_status_t status = cudaSetDeviceForCopy(gpu_dev, previous_device);
@@ -2288,9 +2301,10 @@ nixl_status_t nixlUcxEngine::connect(const std::string &remote_agent) {
 }
 
 nixl_status_t nixlUcxEngine::disconnect(const std::string &remote_agent) {
-    // Reclaim staged leases even when no connection exists: a staging target
-    // (e.g. SGLang decode) may hold leases from an initiator it never connected to.
-    size_t reclaimed = 0;
+    // A disconnect does not prove that an already-posted remote write can no
+    // longer arrive.  Keep reserved target addresses quarantined rather than
+    // returning them to the shared pool.
+    size_t quarantined = 0;
     std::vector<nixlUcxStagedSlotPool *> pools;
     {
         const std::lock_guard pool_lock(stagedPoolMutex_);
@@ -2300,10 +2314,10 @@ nixl_status_t nixlUcxEngine::disconnect(const std::string &remote_agent) {
         }
     }
     for (auto *pool : pools) {
-        reclaimed += pool->releaseLeasesForOwner(remote_agent);
+        quarantined += pool->quarantineLeasesForOwner(remote_agent);
     }
-    if (reclaimed != 0) {
-        NIXL_INFO << "Reclaimed " << reclaimed << " UCX staged slot lease(s) held by "
+    if (quarantined != 0) {
+        NIXL_WARN << "Quarantined " << quarantined << " UCX staged slot lease(s) held by "
                   << remote_agent << " on disconnect";
     }
 
@@ -2545,7 +2559,7 @@ nixlUcxEngine::ensureStagedPool(uint64_t gpu_dev, nixlUcxStagedSlotPool *&pool) 
                   uint64_t transfer_id,
                   uint64_t chunk_id,
                   uint64_t lease_id) {
-            NIXL_WARN << "Quarantining expired UCX staged RX lease gpu_dev=" << gpu_dev
+            NIXL_WARN << "Quarantining UCX staged RX lease gpu_dev=" << gpu_dev
                       << " slot_id=" << slot_id << " owner=" << owner
                       << " transfer_id=" << transfer_id << " chunk_id=" << chunk_id
                       << " lease_id=" << lease_id;
@@ -3414,7 +3428,7 @@ nixlUcxEngine::handleStagedSlotRelease(const nixl_blob_t &message) const {
         }
         status = NIXL_ERR_NOT_FOUND;
         for (auto *pool : pools) {
-            if (pool->releaseRemoteLease(
+            if (pool->quarantineRemoteLease(
                     remote_agent, transfer_id, chunk_id, slot_id, lease_id)) {
                 status = NIXL_SUCCESS;
                 break;
@@ -3427,7 +3441,7 @@ nixlUcxEngine::handleStagedSlotRelease(const nixl_blob_t &message) const {
     }
 
     if (status != NIXL_SUCCESS) {
-        NIXL_WARN << "UCX staged SLOT_RELEASE did not release a lease transfer_id="
+        NIXL_WARN << "UCX staged SLOT_RELEASE did not match/quarantine a lease transfer_id="
                   << transfer_id << " chunk_id=" << chunk_id << " slot_id=" << slot_id
                   << " lease_id=" << lease_id << " status=" << status;
     }
@@ -4599,6 +4613,9 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                         remote_pool.rxRkeys[worker_id],
                         chunk.size,
                         req);
+        if (ret == NIXL_SUCCESS || ret == NIXL_IN_PROG) {
+            chunk.sourceSlotUnsafe = true;
+        }
         if (vramStagingConfig_.batchFlush) {
             if (!staged_handle->openFlushBatch) {
                 auto batch = std::make_unique<nixlUcxStagedFlushBatch>();
@@ -4751,6 +4768,9 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                                       chunk.size,
                                       conn->getEp(staged_handle->getWorkerId()),
                                       &req);
+        if (send_status == NIXL_SUCCESS || send_status == NIXL_IN_PROG) {
+            chunk.sourceSlotUnsafe = true;
+        }
         const nixl_status_t append_status = chunk.req->append(send_status, req, conn);
         if (append_status != NIXL_SUCCESS) {
             return append_status;
@@ -4813,6 +4833,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                     staged_handle->profile.rdmaFlushWaitUs +=
                         flush_done_us - chunk->rdmaPostedUs;
                 }
+                chunk->sourceSlotUnsafe = false;
                 staged_handle->releaseLocalSlot(*chunk);
                 const nixl_status_t ready_status = send_ready(*chunk);
                 if (ready_status != NIXL_SUCCESS) {
@@ -4962,6 +4983,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                         return fail(status);
                     }
 
+                    chunk.sourceSlotUnsafe = false;
                     staged_handle->releaseLocalSlot(chunk);
                     if (chunk.rdmaPostedUs != 0) {
                         staged_handle->profile.rdmaFlushWaitUs +=
@@ -5001,6 +5023,9 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                         continue;
                     }
                     if (status != NIXL_SUCCESS) {
+                        // An ACK, including an error ACK, is terminal for the
+                        // target's read of a local shared slot.
+                        chunk.sourceSlotUnsafe = false;
                         if (chunk.localSharedWrite) {
                             ++staged_handle->profile.localSharedAckErrors;
                         }
@@ -5027,6 +5052,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                     }
 
                     if (chunk.localSharedWrite) {
+                        chunk.sourceSlotUnsafe = false;
                         staged_handle->releaseLocalSlot(chunk);
                     } else {
                         staged_handle->releaseRemoteSlot(chunk);

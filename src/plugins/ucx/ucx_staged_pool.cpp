@@ -101,6 +101,15 @@ nixlUcxStagedSlotPool::releaseTxSlot(size_t slot_id) {
     }
 }
 
+void
+nixlUcxStagedSlotPool::quarantineTxSlot(size_t slot_id) {
+    const std::lock_guard lock(mutex_);
+    if (slot_id < txStates_.size() &&
+        txStates_[slot_id] == nixlUcxStagedSlotState::LOCAL_D2H) {
+        txStates_[slot_id] = nixlUcxStagedSlotState::QUARANTINED;
+    }
+}
+
 uint64_t
 nixlUcxStagedSlotPool::txGeneration(size_t slot_id) const {
     const std::lock_guard lock(mutex_);
@@ -235,8 +244,7 @@ nixlUcxStagedSlotPool::beginRemoteH2D(const std::string &owner_agent,
     }
 
     auto &lease = rxLeases_[slot_id];
-    if ((lease.state != nixlUcxStagedSlotState::REMOTE_RESERVED &&
-         lease.state != nixlUcxStagedSlotState::QUARANTINED) ||
+    if (lease.state != nixlUcxStagedSlotState::REMOTE_RESERVED ||
         lease.ownerAgent != owner_agent || lease.transferId != transfer_id ||
         lease.chunkId != chunk_id || lease.leaseId != lease_id ||
         lease.gpuAddr != gpu_addr || lease.gpuDev != gpu_dev || lease.size != size) {
@@ -287,11 +295,11 @@ nixlUcxStagedSlotPool::finishRemoteLease(uint64_t slot_id,
 }
 
 bool
-nixlUcxStagedSlotPool::releaseRemoteLease(const std::string &owner_agent,
-                                          uint64_t transfer_id,
-                                          uint64_t chunk_id,
-                                          uint64_t slot_id,
-                                          uint64_t lease_id) {
+nixlUcxStagedSlotPool::quarantineRemoteLease(const std::string &owner_agent,
+                                             uint64_t transfer_id,
+                                             uint64_t chunk_id,
+                                             uint64_t slot_id,
+                                             uint64_t lease_id) {
     const std::lock_guard lock(mutex_);
     if (slot_id >= rxLeases_.size()) {
         return false;
@@ -305,29 +313,38 @@ nixlUcxStagedSlotPool::releaseRemoteLease(const std::string &owner_agent,
         return false;
     }
 
-    decrementGrantCount(lease.ownerAgent);
-    lease.reset();
+    // SLOT_RELEASE can race with a previously posted data-plane write.  The
+    // target cannot prove from the control message alone that the old writer
+    // has stopped, so retain the lease as a fail-stop quarantine instead of
+    // making its address available to a new request.
+    if (lease.state == nixlUcxStagedSlotState::REMOTE_RESERVED) {
+        lease.state = nixlUcxStagedSlotState::QUARANTINED;
+        if (quarantineCallback_) {
+            quarantineCallback_(
+                slot_id, lease.ownerAgent, lease.transferId, lease.chunkId, lease.leaseId);
+        }
+    }
     return true;
 }
 
 size_t
-nixlUcxStagedSlotPool::releaseLeasesForOwner(const std::string &owner_agent) {
+nixlUcxStagedSlotPool::quarantineLeasesForOwner(const std::string &owner_agent) {
     const std::lock_guard lock(mutex_);
-    size_t released = 0;
-    for (auto &lease : rxLeases_) {
+    size_t quarantined = 0;
+    for (size_t slot_id = 0; slot_id < rxLeases_.size(); ++slot_id) {
+        auto &lease = rxLeases_[slot_id];
         if (lease.ownerAgent != owner_agent ||
-            (lease.state != nixlUcxStagedSlotState::REMOTE_RESERVED &&
-             lease.state != nixlUcxStagedSlotState::QUARANTINED &&
-             lease.state != nixlUcxStagedSlotState::ERROR)) {
+            lease.state != nixlUcxStagedSlotState::REMOTE_RESERVED) {
             continue;
         }
-        if (lease.state != nixlUcxStagedSlotState::ERROR) {
-            decrementGrantCount(lease.ownerAgent);
+        lease.state = nixlUcxStagedSlotState::QUARANTINED;
+        ++quarantined;
+        if (quarantineCallback_) {
+            quarantineCallback_(
+                slot_id, lease.ownerAgent, lease.transferId, lease.chunkId, lease.leaseId);
         }
-        lease.reset();
-        ++released;
     }
-    return released;
+    return quarantined;
 }
 
 bool

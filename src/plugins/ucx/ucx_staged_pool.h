@@ -94,6 +94,9 @@ public:
     void
     releaseTxSlot(size_t slot_id);
 
+    void
+    quarantineTxSlot(size_t slot_id);
+
     [[nodiscard]] uint64_t
     txGeneration(size_t slot_id) const;
 
@@ -121,14 +124,14 @@ public:
     finishRemoteLease(uint64_t slot_id, uint64_t lease_id, nixl_status_t status);
 
     [[nodiscard]] bool
-    releaseRemoteLease(const std::string &owner_agent,
-                       uint64_t transfer_id,
-                       uint64_t chunk_id,
-                       uint64_t slot_id,
-                       uint64_t lease_id);
+    quarantineRemoteLease(const std::string &owner_agent,
+                          uint64_t transfer_id,
+                          uint64_t chunk_id,
+                          uint64_t slot_id,
+                          uint64_t lease_id);
 
     size_t
-    releaseLeasesForOwner(const std::string &owner_agent);
+    quarantineLeasesForOwner(const std::string &owner_agent);
 
     [[nodiscard]] bool
     hasLeasesForToken(uint64_t region_token) const;

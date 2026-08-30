@@ -107,7 +107,7 @@ TEST_F(StagedPoolTest, ExpiredReservedLeasesAreQuarantinedAndNeverRegranted) {
     EXPECT_EQ(pool->rxState(second.slotId), nixlUcxStagedSlotState::QUARANTINED);
 }
 
-TEST_F(StagedPoolTest, LateMatchingReadySettlesQuarantinedLease) {
+TEST_F(StagedPoolTest, LateMatchingReadyCannotReviveQuarantinedLease) {
     auto pool = makePool(1, 1);
     const auto grant = reserve(*pool, "peer", 1, 1, 11);
     ASSERT_EQ(grant.status, NIXL_SUCCESS);
@@ -115,37 +115,46 @@ TEST_F(StagedPoolTest, LateMatchingReadySettlesQuarantinedLease) {
     EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_IN_PROG);
 
     EXPECT_EQ(begin(*pool, "other", 1, 1, grant), NIXL_ERR_MISMATCH);
-    EXPECT_EQ(begin(*pool, "peer", 1, 1, grant), NIXL_SUCCESS);
+    EXPECT_EQ(begin(*pool, "peer", 1, 1, grant), NIXL_ERR_MISMATCH);
     pool->finishRemoteLease(grant.slotId, grant.leaseId, NIXL_SUCCESS);
-    EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_SUCCESS);
+    EXPECT_EQ(pool->rxState(grant.slotId), nixlUcxStagedSlotState::QUARANTINED);
+    EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_IN_PROG);
 }
 
-TEST_F(StagedPoolTest, LateReleaseFreesQuarantinedLease) {
+TEST_F(StagedPoolTest, LateReleaseCannotFreeQuarantinedLease) {
     auto pool = makePool(1, 1);
     const auto grant = reserve(*pool, "peer", 1, 1);
     ASSERT_EQ(grant.status, NIXL_SUCCESS);
     nowUs_ += 11;
     EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_IN_PROG);
 
-    EXPECT_TRUE(pool->releaseRemoteLease("peer", 1, 1, grant.slotId, grant.leaseId));
-    EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_SUCCESS);
+    EXPECT_TRUE(pool->quarantineRemoteLease("peer", 1, 1, grant.slotId, grant.leaseId));
+    EXPECT_EQ(pool->rxState(grant.slotId), nixlUcxStagedSlotState::QUARANTINED);
+    EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_IN_PROG);
 }
 
-TEST_F(StagedPoolTest, OwnerReleaseSkipsH2DAndOtherOwners) {
-    auto pool = makePool(1, 4, 10, 4);
-    const auto a_quarantine = reserve(*pool, "a", 1, 1);
-    const auto a_h2d = reserve(*pool, "a", 1, 2);
-    const auto b_first = reserve(*pool, "b", 2, 1);
-    const auto b_second = reserve(*pool, "b", 2, 2);
-    ASSERT_EQ(begin(*pool, "a", 1, 2, a_h2d), NIXL_SUCCESS);
-    nowUs_ += 11;
-    EXPECT_EQ(reserve(*pool, "c", 3, 1).status, NIXL_IN_PROG);
+TEST_F(StagedPoolTest, SlotReleaseQuarantinesReservedLease) {
+    auto pool = makePool(1, 1);
+    const auto grant = reserve(*pool, "peer", 1, 1);
+    ASSERT_EQ(grant.status, NIXL_SUCCESS);
 
-    EXPECT_EQ(pool->releaseLeasesForOwner("a"), 1u);
-    EXPECT_EQ(pool->rxState(a_quarantine.slotId), nixlUcxStagedSlotState::FREE);
+    EXPECT_TRUE(pool->quarantineRemoteLease("peer", 1, 1, grant.slotId, grant.leaseId));
+
+    EXPECT_EQ(pool->rxState(grant.slotId), nixlUcxStagedSlotState::QUARANTINED);
+    EXPECT_EQ(reserve(*pool, "other", 2, 1).status, NIXL_IN_PROG);
+}
+
+TEST_F(StagedPoolTest, OwnerDisconnectQuarantinesReservedLeaseOnly) {
+    auto pool = makePool(1, 4, 10, 4);
+    const auto a_reserved = reserve(*pool, "a", 1, 1);
+    const auto a_h2d = reserve(*pool, "a", 1, 2);
+    const auto b_reserved = reserve(*pool, "b", 2, 1);
+    ASSERT_EQ(begin(*pool, "a", 1, 2, a_h2d), NIXL_SUCCESS);
+
+    EXPECT_EQ(pool->quarantineLeasesForOwner("a"), 1u);
+    EXPECT_EQ(pool->rxState(a_reserved.slotId), nixlUcxStagedSlotState::QUARANTINED);
     EXPECT_EQ(pool->rxState(a_h2d.slotId), nixlUcxStagedSlotState::REMOTE_H2D);
-    EXPECT_EQ(pool->rxState(b_first.slotId), nixlUcxStagedSlotState::QUARANTINED);
-    EXPECT_EQ(pool->rxState(b_second.slotId), nixlUcxStagedSlotState::QUARANTINED);
+    EXPECT_EQ(pool->rxState(b_reserved.slotId), nixlUcxStagedSlotState::REMOTE_RESERVED);
 }
 
 TEST_F(StagedPoolTest, ErrorLeaseIsReclaimedUnderPressure) {
@@ -195,6 +204,19 @@ TEST_F(StagedPoolTest, TxGenerationAdvancesAtPoolScopeOnReuse) {
     ASSERT_EQ(second.status, NIXL_SUCCESS);
     EXPECT_EQ(second.slotId, first.slotId);
     EXPECT_EQ(pool->txGeneration(second.slotId), 2u);
+}
+
+TEST_F(StagedPoolTest, QuarantinedTxSlotIsNeverReused) {
+    auto pool = makePool(1, 1);
+    const auto slot = pool->acquireTxSlot();
+    ASSERT_EQ(slot.status, NIXL_SUCCESS);
+
+    pool->quarantineTxSlot(slot.slotId);
+
+    EXPECT_EQ(pool->txState(slot.slotId), nixlUcxStagedSlotState::QUARANTINED);
+    EXPECT_EQ(pool->acquireTxSlot().status, NIXL_IN_PROG);
+    pool->releaseTxSlot(slot.slotId);
+    EXPECT_EQ(pool->txState(slot.slotId), nixlUcxStagedSlotState::QUARANTINED);
 }
 
 TEST_F(StagedPoolTest, TokenBookkeepingSurvivesReserveBeginAndQuarantine) {
