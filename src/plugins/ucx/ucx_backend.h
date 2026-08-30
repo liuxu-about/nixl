@@ -25,6 +25,7 @@
 #include <shared_mutex>
 #include <memory>
 #include <condition_variable>
+#include <cstdint>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -46,6 +47,11 @@
 
 class nixlUcxStagedSlotPool;
 struct nixlUcxStagedRemotePool;
+
+enum class nixlUcxStagedSlotReleaseKind : uint8_t {
+    SAFE_CANCEL = 0,
+    QUARANTINE = 1,
+};
 
 class nixlUcxConnection : public nixlBackendConnMD {
     private:
@@ -371,7 +377,9 @@ private:
                           uint64_t lease_id,
                           uintptr_t remote_gpu_addr,
                           uint64_t remote_gpu_dev,
-                          size_t size) const;
+                          size_t size,
+                          nixlUcxStagedSlotReleaseKind kind =
+                              nixlUcxStagedSlotReleaseKind::QUARANTINE) const;
 
     nixl_status_t
     sendStagedWriteReady(const std::string &remote_agent,

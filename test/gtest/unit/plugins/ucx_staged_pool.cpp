@@ -144,6 +144,38 @@ TEST_F(StagedPoolTest, SlotReleaseQuarantinesReservedLease) {
     EXPECT_EQ(reserve(*pool, "other", 2, 1).status, NIXL_IN_PROG);
 }
 
+TEST_F(StagedPoolTest, SafeCancelCanReuseRxSlotRepeatedly) {
+    auto pool = makePool(1, 4, 10, 4);
+    for (uint64_t transfer = 1; transfer <= 20; ++transfer) {
+        const auto grant = reserve(*pool, "peer", transfer, 1);
+        ASSERT_EQ(grant.status, NIXL_SUCCESS);
+        ASSERT_TRUE(
+            pool->cancelRemoteLease("peer", transfer, 1, grant.slotId, grant.leaseId));
+        EXPECT_EQ(pool->rxState(grant.slotId), nixlUcxStagedSlotState::FREE);
+    }
+}
+
+TEST_F(StagedPoolTest, SafeCancelCannotReviveStartedH2DLease) {
+    auto pool = makePool(1, 1);
+    const auto grant = reserve(*pool, "peer", 1, 1);
+    ASSERT_EQ(grant.status, NIXL_SUCCESS);
+    ASSERT_EQ(begin(*pool, "peer", 1, 1, grant), NIXL_SUCCESS);
+
+    EXPECT_FALSE(pool->cancelRemoteLease("peer", 1, 1, grant.slotId, grant.leaseId));
+    EXPECT_EQ(pool->rxState(grant.slotId), nixlUcxStagedSlotState::REMOTE_H2D);
+}
+
+TEST_F(StagedPoolTest, QuarantineDoesNotLeaveGhostGrantQuota) {
+    auto pool = makePool(1, 4, 10, 2);
+    const auto a = reserve(*pool, "a", 1, 1);
+    ASSERT_EQ(a.status, NIXL_SUCCESS);
+    ASSERT_TRUE(pool->quarantineRemoteLease("a", 1, 1, a.slotId, a.leaseId));
+
+    ASSERT_EQ(reserve(*pool, "b", 2, 1).status, NIXL_SUCCESS);
+    ASSERT_EQ(reserve(*pool, "b", 2, 2).status, NIXL_SUCCESS);
+    EXPECT_EQ(reserve(*pool, "b", 2, 3).status, NIXL_SUCCESS);
+}
+
 TEST_F(StagedPoolTest, OwnerDisconnectQuarantinesReservedLeaseOnly) {
     auto pool = makePool(1, 4, 10, 4);
     const auto a_reserved = reserve(*pool, "a", 1, 1);

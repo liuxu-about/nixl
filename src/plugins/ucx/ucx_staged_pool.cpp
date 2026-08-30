@@ -206,6 +206,7 @@ nixlUcxStagedSlotPool::reserveRxSlot(const std::string &owner_agent,
             continue;
         }
 
+        decrementGrantCount(lease.ownerAgent);
         lease.state = nixlUcxStagedSlotState::QUARANTINED;
         if (quarantineCallback_) {
             quarantineCallback_(
@@ -295,6 +296,29 @@ nixlUcxStagedSlotPool::finishRemoteLease(uint64_t slot_id,
 }
 
 bool
+nixlUcxStagedSlotPool::cancelRemoteLease(const std::string &owner_agent,
+                                         uint64_t transfer_id,
+                                         uint64_t chunk_id,
+                                         uint64_t slot_id,
+                                         uint64_t lease_id) {
+    const std::lock_guard lock(mutex_);
+    if (slot_id >= rxLeases_.size()) {
+        return false;
+    }
+
+    auto &lease = rxLeases_[slot_id];
+    if (lease.ownerAgent != owner_agent || lease.transferId != transfer_id ||
+        lease.chunkId != chunk_id || lease.leaseId != lease_id ||
+        lease.state != nixlUcxStagedSlotState::REMOTE_RESERVED) {
+        return false;
+    }
+
+    decrementGrantCount(lease.ownerAgent);
+    lease.reset();
+    return true;
+}
+
+bool
 nixlUcxStagedSlotPool::quarantineRemoteLease(const std::string &owner_agent,
                                              uint64_t transfer_id,
                                              uint64_t chunk_id,
@@ -318,6 +342,7 @@ nixlUcxStagedSlotPool::quarantineRemoteLease(const std::string &owner_agent,
     // has stopped, so retain the lease as a fail-stop quarantine instead of
     // making its address available to a new request.
     if (lease.state == nixlUcxStagedSlotState::REMOTE_RESERVED) {
+        decrementGrantCount(lease.ownerAgent);
         lease.state = nixlUcxStagedSlotState::QUARANTINED;
         if (quarantineCallback_) {
             quarantineCallback_(
@@ -337,6 +362,7 @@ nixlUcxStagedSlotPool::quarantineLeasesForOwner(const std::string &owner_agent) 
             lease.state != nixlUcxStagedSlotState::REMOTE_RESERVED) {
             continue;
         }
+        decrementGrantCount(lease.ownerAgent);
         lease.state = nixlUcxStagedSlotState::QUARANTINED;
         ++quarantined;
         if (quarantineCallback_) {

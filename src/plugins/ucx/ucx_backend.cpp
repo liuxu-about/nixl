@@ -2987,7 +2987,15 @@ nixlUcxEngine::completePendingStagedSlotGrant(const std::string &remote_agent,
     if (bound) {
         if (release_epoch_mismatch) {
             sendStagedSlotRelease(
-                remote_agent, transfer_id, chunk_id, slot_id, lease_id, 0, 0, 0);
+                remote_agent,
+                transfer_id,
+                chunk_id,
+                slot_id,
+                lease_id,
+                0,
+                0,
+                0,
+                nixlUcxStagedSlotReleaseKind::SAFE_CANCEL);
         }
         return;
     }
@@ -2997,7 +3005,15 @@ nixlUcxEngine::completePendingStagedSlotGrant(const std::string &remote_agent,
     // slot stays REMOTE_RESERVED until timeout reclaim. The zero gpu fields tell
     // the target to resolve the lease by slot/lease id alone.
     if (status == NIXL_SUCCESS) {
-        sendStagedSlotRelease(remote_agent, transfer_id, chunk_id, slot_id, lease_id, 0, 0, 0);
+        sendStagedSlotRelease(remote_agent,
+                              transfer_id,
+                              chunk_id,
+                              slot_id,
+                              lease_id,
+                              0,
+                              0,
+                              0,
+                              nixlUcxStagedSlotReleaseKind::SAFE_CANCEL);
     }
 }
 
@@ -3110,7 +3126,8 @@ nixlUcxEngine::sendStagedSlotRelease(const std::string &remote_agent,
                                      uint64_t lease_id,
                                      uintptr_t remote_gpu_addr,
                                      uint64_t remote_gpu_dev,
-                                     size_t size) const {
+                                     size_t size,
+                                     nixlUcxStagedSlotReleaseKind kind) const {
     const auto conn = getConnection(remote_agent);
     if (!conn) {
         NIXL_WARN << "Cannot send UCX staged SLOT_RELEASE to unknown agent " << remote_agent
@@ -3127,6 +3144,8 @@ nixlUcxEngine::sendStagedSlotRelease(const std::string &remote_agent,
     ser_des.addBuf("gpu_addr", &remote_gpu_addr, sizeof(remote_gpu_addr));
     ser_des.addBuf("gpu_dev", &remote_gpu_dev, sizeof(remote_gpu_dev));
     ser_des.addBuf("size", &size, sizeof(size));
+    const uint8_t release_kind = static_cast<uint8_t>(kind);
+    ser_des.addBuf("release_kind", &release_kind, sizeof(release_kind));
 
     std::string *buffer = new std::string(ser_des.exportStr());
     auto deleter = [buffer](void *completed_request, void *ptr) {
@@ -3391,6 +3410,8 @@ nixlUcxEngine::handleStagedSlotRelease(const nixl_blob_t &message) const {
     uintptr_t gpu_addr = 0;
     uint64_t gpu_dev = 0;
     size_t size = 0;
+    uint8_t release_kind_raw =
+        static_cast<uint8_t>(nixlUcxStagedSlotReleaseKind::QUARANTINE);
 
     nixl_status_t status =
         ser_des.getBuf("xfer_id", &transfer_id, sizeof(transfer_id)) == NIXL_SUCCESS &&
@@ -3402,6 +3423,18 @@ nixlUcxEngine::handleStagedSlotRelease(const nixl_blob_t &message) const {
                 ser_des.getBuf("size", &size, sizeof(size)) == NIXL_SUCCESS ?
             NIXL_SUCCESS :
             NIXL_ERR_MISMATCH;
+
+    // Old senders do not include release_kind. Missing or unknown values must
+    // remain fail-closed and quarantine the lease.
+    if (ser_des.getBuf("release_kind", &release_kind_raw, sizeof(release_kind_raw)) !=
+            NIXL_SUCCESS ||
+        release_kind_raw >
+            static_cast<uint8_t>(nixlUcxStagedSlotReleaseKind::QUARANTINE)) {
+        release_kind_raw =
+            static_cast<uint8_t>(nixlUcxStagedSlotReleaseKind::QUARANTINE);
+    }
+    const auto release_kind =
+        static_cast<nixlUcxStagedSlotReleaseKind>(release_kind_raw);
 
     if (remote_agent.empty()) {
         return NIXL_ERR_MISMATCH;
@@ -3428,8 +3461,13 @@ nixlUcxEngine::handleStagedSlotRelease(const nixl_blob_t &message) const {
         }
         status = NIXL_ERR_NOT_FOUND;
         for (auto *pool : pools) {
-            if (pool->quarantineRemoteLease(
-                    remote_agent, transfer_id, chunk_id, slot_id, lease_id)) {
+            const bool released =
+                release_kind == nixlUcxStagedSlotReleaseKind::SAFE_CANCEL ?
+                pool->cancelRemoteLease(
+                    remote_agent, transfer_id, chunk_id, slot_id, lease_id) :
+                pool->quarantineRemoteLease(
+                    remote_agent, transfer_id, chunk_id, slot_id, lease_id);
+            if (released) {
                 status = NIXL_SUCCESS;
                 break;
             }
@@ -3441,9 +3479,10 @@ nixlUcxEngine::handleStagedSlotRelease(const nixl_blob_t &message) const {
     }
 
     if (status != NIXL_SUCCESS) {
-        NIXL_WARN << "UCX staged SLOT_RELEASE did not match/quarantine a lease transfer_id="
+        NIXL_WARN << "UCX staged SLOT_RELEASE did not match a lease transfer_id="
                   << transfer_id << " chunk_id=" << chunk_id << " slot_id=" << slot_id
-                  << " lease_id=" << lease_id << " status=" << status;
+                  << " lease_id=" << lease_id << " release_kind="
+                  << static_cast<unsigned>(release_kind_raw) << " status=" << status;
     }
     return status;
 }
@@ -4493,7 +4532,8 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                               chunk.leaseId,
                               chunk.remoteGpuAddr,
                               chunk.remoteGpuDev,
-                              chunk.size);
+                              chunk.size,
+                              nixlUcxStagedSlotReleaseKind::SAFE_CANCEL);
         staged_handle->releaseRemoteSlot(chunk);
         chunk.grantArrived.store(false);
         chunk.grantStatus.store(NIXL_IN_PROG);
@@ -4506,6 +4546,19 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
             staged_handle->releaseLocalSlot(chunk);
             chunk.state = nixlUcxStagedChunk::State::PENDING;
         }
+    };
+
+    auto safe_cancel_grant = [&](nixlUcxStagedChunk &chunk) {
+        sendStagedSlotRelease(staged_handle->remoteAgent,
+                              staged_handle->transferId,
+                              chunk.id,
+                              chunk.remoteSlotId,
+                              chunk.leaseId,
+                              chunk.remoteGpuAddr,
+                              chunk.remoteGpuDev,
+                              chunk.size,
+                              nixlUcxStagedSlotReleaseKind::SAFE_CANCEL);
+        staged_handle->releaseChunkSlots(chunk);
     };
 
     auto start_granted_chunk = [&](nixlUcxStagedChunk &chunk) -> nixl_status_t {
@@ -4535,7 +4588,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
             int previous_device = -1;
             ret = cudaSetDeviceForCopy(chunk.localGpuDev, previous_device);
             if (ret != NIXL_SUCCESS) {
-                staged_handle->releaseChunkSlots(chunk);
+                safe_cancel_grant(chunk);
                 return ret;
             }
 
@@ -4543,7 +4596,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                 chunk.localPool->txHostAddr(chunk.localSlotId);
             if (local_host_addr == nullptr) {
                 cudaRestoreDevice(previous_device);
-                staged_handle->releaseChunkSlots(chunk);
+                safe_cancel_grant(chunk);
                 return NIXL_ERR_MISMATCH;
             }
             const auto local_gpu_addr = reinterpret_cast<void *>(chunk.localGpuAddr);
@@ -4556,15 +4609,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                 NIXL_ERROR << "UCX staged D2H failed for transfer_id="
                            << staged_handle->transferId << " chunk_id=" << chunk.id << ": "
                            << cudaGetErrorString(cuda_ret);
-                sendStagedSlotRelease(staged_handle->remoteAgent,
-                                      staged_handle->transferId,
-                                      chunk.id,
-                                      chunk.remoteSlotId,
-                                      chunk.leaseId,
-                                      chunk.remoteGpuAddr,
-                                      chunk.remoteGpuDev,
-                                      chunk.size);
-                staged_handle->releaseChunkSlots(chunk);
+                safe_cancel_grant(chunk);
                 return NIXL_ERR_BACKEND;
             }
         } else if (!chunk.localSlotHeld) {
@@ -4575,7 +4620,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
         auto *local_mem =
             static_cast<nixlUcxMem *>(chunk.localPool->backing.txRegistration);
         if (local_host_addr == nullptr || local_mem == nullptr) {
-            staged_handle->releaseChunkSlots(chunk);
+            safe_cancel_grant(chunk);
             return NIXL_ERR_MISMATCH;
         }
         const size_t worker_id = staged_handle->getWorkerId();
@@ -4583,15 +4628,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
         const auto &remote_pool = *rmd->remotePool;
         if (chunk.remoteSlotId >= remote_pool.rxCount ||
             worker_id >= remote_pool.rxRkeys.size()) {
-            sendStagedSlotRelease(staged_handle->remoteAgent,
-                                  staged_handle->transferId,
-                                  chunk.id,
-                                  chunk.remoteSlotId,
-                                  chunk.leaseId,
-                                  chunk.remoteGpuAddr,
-                                  chunk.remoteGpuDev,
-                                  chunk.size);
-            staged_handle->releaseChunkSlots(chunk);
+            safe_cancel_grant(chunk);
             return NIXL_ERR_MISMATCH;
         }
 

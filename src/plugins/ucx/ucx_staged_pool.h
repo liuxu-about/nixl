@@ -124,6 +124,13 @@ public:
     finishRemoteLease(uint64_t slot_id, uint64_t lease_id, nixl_status_t status);
 
     [[nodiscard]] bool
+    cancelRemoteLease(const std::string &owner_agent,
+                      uint64_t transfer_id,
+                      uint64_t chunk_id,
+                      uint64_t slot_id,
+                      uint64_t lease_id);
+
+    [[nodiscard]] bool
     quarantineRemoteLease(const std::string &owner_agent,
                           uint64_t transfer_id,
                           uint64_t chunk_id,
