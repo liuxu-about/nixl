@@ -4549,16 +4549,29 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
     };
 
     auto safe_cancel_grant = [&](nixlUcxStagedChunk &chunk) {
-        sendStagedSlotRelease(staged_handle->remoteAgent,
-                              staged_handle->transferId,
-                              chunk.id,
-                              chunk.remoteSlotId,
-                              chunk.leaseId,
-                              chunk.remoteGpuAddr,
-                              chunk.remoteGpuDev,
-                              chunk.size,
-                              nixlUcxStagedSlotReleaseKind::SAFE_CANCEL);
+        const nixl_status_t release_status =
+            sendStagedSlotRelease(staged_handle->remoteAgent,
+                                  staged_handle->transferId,
+                                  chunk.id,
+                                  chunk.remoteSlotId,
+                                  chunk.leaseId,
+                                  chunk.remoteGpuAddr,
+                                  chunk.remoteGpuDev,
+                                  chunk.size,
+                                  nixlUcxStagedSlotReleaseKind::SAFE_CANCEL);
         staged_handle->releaseChunkSlots(chunk);
+
+        // Once UCX accepts SAFE_CANCEL, this grant no longer belongs to the
+        // local state machine. Clear every arrival marker so the generic fail
+        // cleanup cannot mistake it for an unprocessed grant and send a second,
+        // fail-closed QUARANTINE release. If the send itself failed, retain the
+        // markers so fail() still gets one chance to quarantine the lease.
+        if (release_status == NIXL_SUCCESS || release_status == NIXL_IN_PROG) {
+            chunk.grantArrived.store(false);
+            chunk.grantStatus.store(NIXL_IN_PROG);
+            chunk.grantArrivedUs.store(0);
+            chunk.leaseId.store(0);
+        }
     };
 
     auto start_granted_chunk = [&](nixlUcxStagedChunk &chunk) -> nixl_status_t {

@@ -105,9 +105,10 @@ diffs minimal and flag anything non-mechanical):
     owner/transfer/chunk/lease). Then retry the FREE scan. A `QUARANTINED` slot is never
     granted.
   - **per-agent cap**: let `cap = maxGrantsPerAgent` (config §5). Refuse (return IN_PROG) a
-    grant to agent X when X currently holds >= cap RX leases (RESERVED+H2D+QUARANTINED
-    combined) AND at least one other agent currently holds >= 1 RX lease. With a single active
-    agent the cap is not enforced.
+    grant to agent X when X currently holds >= cap active RX grants (RESERVED+H2D) AND at least
+    one other agent currently holds >= 1 active RX grant. Quarantine removes a lease from active
+    grant accounting so it cannot leave ghost quota; the quarantined slot itself remains
+    unavailable until pool rebuild. With a single active agent the cap is not enforced.
 - `beginRemoteH2D(...)` — accepts only `REMOTE_RESERVED`; a quarantined lease cannot be revived.
   On success state -> `REMOTE_H2D` as usual.
 - `finishRemoteLease(slot_id, lease_id, status)` — unchanged semantics (SUCCESS -> FREE,
@@ -288,8 +289,9 @@ two-stage override order in `makeVramStagingConfig`). The startup NIXL_INFO log 
 - `sendStagedSlotGrant` / grant AM: add `"pool_epoch"` u64. Initiator on grant receipt: if
   `pool_epoch != remotePool->poolEpoch`, treat as terminal chunk error (metadata is stale) — log
   and fail the transfer; do NOT retry.
-- `SLOT_RELEASE`: fields unchanged (slot_id now RX-relative pool id). Handler: `gpu_dev` routes
-  to the pool (`by_id` releases scan all pools — there are at most a handful).
+- `SLOT_RELEASE`: add `release_kind` (`SAFE_CANCEL` or `QUARANTINE`; missing/unknown values fall
+  back to `QUARANTINE`). `slot_id` is now an RX-relative pool id. Handler: `gpu_dev` routes to the
+  pool (`by_id` releases scan all pools — there are at most a handful).
 - `WRITE_READY` / `ACK`: fields unchanged; handler routes by `gpu_dev` to the pool.
 - `LOCAL_WRITE_READY` (`sendStagedLocalWriteReady` / `handleStagedLocalWriteReady`): replace
   region-scoped fields (`source_region_id`, `source_region_cookie`, `source_shared_path`,

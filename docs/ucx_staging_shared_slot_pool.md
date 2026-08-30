@@ -185,8 +185,10 @@ Message shapes are unchanged except where noted:
   pool_epoch}`. The initiator computes the target address from the RemotePool descriptor; an
   epoch mismatch (pool rebuilt since metadata load) is treated as a failed grant and surfaces as
   a transfer error prompting metadata reload.
-- **SLOT_RELEASE / WRITE_READY / ACK** — unchanged; lease lookup moves to the pool
-  (release-by-id scans the handful of device pools instead of 96 regions).
+- **SLOT_RELEASE** — gains `release_kind` (`SAFE_CANCEL` or `QUARANTINE`; missing/unknown values
+  fail closed to `QUARANTINE`); lease lookup moves to the pool (release-by-id scans the handful
+  of device pools instead of 96 regions).
+- **WRITE_READY / ACK** — unchanged; lease lookup moves to the pool.
 - **LOCAL_WRITE_READY** — region-scoped shm fields become pool-scoped (epoch, pool cookie/path,
   slot_id, generation, offset). The target's attachment cache holds one mapping per peer pool
   instead of one per peer region.
@@ -264,9 +266,11 @@ timed-out leases stop being re-granted:
 - The initiator-side stale-grant guard (refuse grants older than half the lease timeout) stays
   as cheap defense in depth.
 
-A frozen-but-connected peer can now pin RX slots in quarantine indefinitely; the per-agent grant
-cap (section 5) limits the damage to that agent's cap, and epoch rebuild recovers the rest. This
-is strictly safer than the current silent-corruption window.
+A frozen-but-connected peer can now pin RX slots in quarantine indefinitely. The per-agent grant
+cap (section 5) limits simultaneous active grants while peers contend, but quarantined leases are
+removed from active grant accounting to avoid ghost quota; repeated failures can therefore
+accumulate quarantined slots until an epoch rebuild. This is strictly safer than the current
+silent-corruption window and makes pool-health monitoring important.
 
 ### 7. Region and pool lifecycle
 

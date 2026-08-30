@@ -360,8 +360,10 @@ initiator:          release local slot and mark chunk done
 ```
 
 `STAGED_SLOT_RELEASE` is used when an initiator has received a grant but cannot complete the chunk
-path, for example D2H failure, UCX write failure, UCX flush failure, READY send failure, request
-release, cancellation, or remote disconnect handling.
+path. It carries a `release_kind`: `SAFE_CANCEL` is valid only while no data-plane write was
+posted; `QUARANTINE` is used once a write may have been posted. Missing or unknown values fail
+closed to `QUARANTINE`. Examples include D2H failure before write (`SAFE_CANCEL`) and UCX write,
+flush, READY, request-release, cancellation, or ambiguous teardown failures (`QUARANTINE`).
 
 The target side must process internal messages even when the application is not calling
 `getNotifs`. Staged mode should therefore require a progress thread or provide a backend-owned
