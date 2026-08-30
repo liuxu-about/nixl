@@ -89,6 +89,16 @@ nixlUcxStagedSlotPool::acquireTxSlot() {
         }
         return {.slotId = static_cast<uint64_t>(i), .status = NIXL_SUCCESS};
     }
+
+    const bool has_active_slot =
+        std::any_of(txStates_.begin(), txStates_.end(), [](const auto state) {
+            return state == nixlUcxStagedSlotState::LOCAL_D2H;
+        });
+    if (!has_active_slot) {
+        // No slot can become FREE without rebuilding this process-local pool.
+        // Do not report permanent quarantine exhaustion as transient backpressure.
+        return {.status = NIXL_ERR_BACKEND};
+    }
     return {.status = NIXL_IN_PROG};
 }
 
@@ -225,6 +235,17 @@ nixlUcxStagedSlotPool::reserveRxSlot(const std::string &owner_agent,
                                gpu_dev,
                                size);
         }
+    }
+
+    const bool has_active_lease =
+        std::any_of(rxLeases_.begin(), rxLeases_.end(), [](const auto &lease) {
+            return lease.state == nixlUcxStagedSlotState::REMOTE_RESERVED ||
+                   lease.state == nixlUcxStagedSlotState::REMOTE_H2D;
+        });
+    if (!has_active_lease) {
+        // ERROR leases were reclaimed above. With no FREE or active lease left,
+        // every RX slot is permanently quarantined until the pool is rebuilt.
+        return {.status = NIXL_ERR_BACKEND};
     }
     return {.status = NIXL_IN_PROG};
 }

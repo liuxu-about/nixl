@@ -240,6 +240,10 @@ Current limitations:
   `STAGED_SLOT_REQ` finds the pool exhausted, after `staging_lease_timeout_ms`. There is no
   proactive keepalive-based peer death detection; the target side has no UCX endpoint to the
   initiator in the SGLang topology, so endpoint error callbacks cannot be used there.
+- Slot pressure is reported as `NIXL_IN_PROG` only while an active TX/RX operation may still
+  release capacity. If every slot in a role is permanently quarantined, the pool returns
+  `NIXL_ERR_BACKEND` so callers fail terminally instead of retrying forever; rebuilding the
+  process-local pool remains the recovery mechanism.
 
 ## Registration Model
 

@@ -102,7 +102,7 @@ TEST_F(StagedPoolTest, ExpiredReservedLeasesAreQuarantinedAndNeverRegranted) {
     ASSERT_EQ(second.status, NIXL_SUCCESS);
 
     nowUs_ += 11;
-    EXPECT_EQ(reserve(*pool, "peer", 1, 3).status, NIXL_IN_PROG);
+    EXPECT_EQ(reserve(*pool, "peer", 1, 3).status, NIXL_ERR_BACKEND);
     EXPECT_EQ(pool->rxState(first.slotId), nixlUcxStagedSlotState::QUARANTINED);
     EXPECT_EQ(pool->rxState(second.slotId), nixlUcxStagedSlotState::QUARANTINED);
 }
@@ -112,13 +112,13 @@ TEST_F(StagedPoolTest, LateMatchingReadyCannotReviveQuarantinedLease) {
     const auto grant = reserve(*pool, "peer", 1, 1, 11);
     ASSERT_EQ(grant.status, NIXL_SUCCESS);
     nowUs_ += 11;
-    EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_IN_PROG);
+    EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_ERR_BACKEND);
 
     EXPECT_EQ(begin(*pool, "other", 1, 1, grant), NIXL_ERR_MISMATCH);
     EXPECT_EQ(begin(*pool, "peer", 1, 1, grant), NIXL_ERR_MISMATCH);
     pool->finishRemoteLease(grant.slotId, grant.leaseId, NIXL_SUCCESS);
     EXPECT_EQ(pool->rxState(grant.slotId), nixlUcxStagedSlotState::QUARANTINED);
-    EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_IN_PROG);
+    EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_ERR_BACKEND);
 }
 
 TEST_F(StagedPoolTest, LateReleaseCannotFreeQuarantinedLease) {
@@ -126,11 +126,11 @@ TEST_F(StagedPoolTest, LateReleaseCannotFreeQuarantinedLease) {
     const auto grant = reserve(*pool, "peer", 1, 1);
     ASSERT_EQ(grant.status, NIXL_SUCCESS);
     nowUs_ += 11;
-    EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_IN_PROG);
+    EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_ERR_BACKEND);
 
     EXPECT_TRUE(pool->quarantineRemoteLease("peer", 1, 1, grant.slotId, grant.leaseId));
     EXPECT_EQ(pool->rxState(grant.slotId), nixlUcxStagedSlotState::QUARANTINED);
-    EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_IN_PROG);
+    EXPECT_EQ(reserve(*pool, "peer", 2, 1).status, NIXL_ERR_BACKEND);
 }
 
 TEST_F(StagedPoolTest, SlotReleaseQuarantinesReservedLease) {
@@ -141,7 +141,7 @@ TEST_F(StagedPoolTest, SlotReleaseQuarantinesReservedLease) {
     EXPECT_TRUE(pool->quarantineRemoteLease("peer", 1, 1, grant.slotId, grant.leaseId));
 
     EXPECT_EQ(pool->rxState(grant.slotId), nixlUcxStagedSlotState::QUARANTINED);
-    EXPECT_EQ(reserve(*pool, "other", 2, 1).status, NIXL_IN_PROG);
+    EXPECT_EQ(reserve(*pool, "other", 2, 1).status, NIXL_ERR_BACKEND);
 }
 
 TEST_F(StagedPoolTest, SafeCancelCanReuseRxSlotRepeatedly) {
@@ -246,9 +246,39 @@ TEST_F(StagedPoolTest, QuarantinedTxSlotIsNeverReused) {
     pool->quarantineTxSlot(slot.slotId);
 
     EXPECT_EQ(pool->txState(slot.slotId), nixlUcxStagedSlotState::QUARANTINED);
-    EXPECT_EQ(pool->acquireTxSlot().status, NIXL_IN_PROG);
+    EXPECT_EQ(pool->acquireTxSlot().status, NIXL_ERR_BACKEND);
     pool->releaseTxSlot(slot.slotId);
     EXPECT_EQ(pool->txState(slot.slotId), nixlUcxStagedSlotState::QUARANTINED);
+}
+
+TEST_F(StagedPoolTest, MixedActiveAndQuarantinedTxSlotsRemainTransient) {
+    auto pool = makePool(2, 1);
+    const auto quarantined = pool->acquireTxSlot();
+    const auto active = pool->acquireTxSlot();
+    ASSERT_EQ(quarantined.status, NIXL_SUCCESS);
+    ASSERT_EQ(active.status, NIXL_SUCCESS);
+
+    pool->quarantineTxSlot(quarantined.slotId);
+    EXPECT_EQ(pool->acquireTxSlot().status, NIXL_IN_PROG);
+
+    pool->releaseTxSlot(active.slotId);
+    EXPECT_EQ(pool->acquireTxSlot().status, NIXL_SUCCESS);
+}
+
+TEST_F(StagedPoolTest, MixedActiveAndQuarantinedRxSlotsRemainTransient) {
+    auto pool = makePool(1, 2, 0, 2);
+    const auto quarantined = reserve(*pool, "a", 1, 1);
+    const auto active = reserve(*pool, "b", 2, 1);
+    ASSERT_EQ(quarantined.status, NIXL_SUCCESS);
+    ASSERT_EQ(active.status, NIXL_SUCCESS);
+    ASSERT_TRUE(pool->quarantineRemoteLease(
+        "a", 1, 1, quarantined.slotId, quarantined.leaseId));
+
+    EXPECT_EQ(reserve(*pool, "c", 3, 1).status, NIXL_IN_PROG);
+
+    ASSERT_EQ(begin(*pool, "b", 2, 1, active), NIXL_SUCCESS);
+    pool->finishRemoteLease(active.slotId, active.leaseId, NIXL_SUCCESS);
+    EXPECT_EQ(reserve(*pool, "c", 3, 1).status, NIXL_SUCCESS);
 }
 
 TEST_F(StagedPoolTest, TokenBookkeepingSurvivesReserveBeginAndQuarantine) {

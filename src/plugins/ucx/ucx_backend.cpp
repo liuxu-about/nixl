@@ -3370,6 +3370,11 @@ nixlUcxEngine::handleStagedSlotReq(const nixl_blob_t &message, ucp_ep_h reply_ep
                 status = grant.status;
                 slot_id = grant.slotId;
                 lease_id = grant.leaseId;
+                if (status == NIXL_ERR_BACKEND) {
+                    NIXL_ERROR << "UCX staged RX pool permanently exhausted gpu_dev="
+                               << gpu_dev << " pool_epoch=" << staged->pool->poolEpoch
+                               << " rx_slots=" << staged->pool->rxCount;
+                }
             }
         }
     }
@@ -4411,6 +4416,12 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
             return NIXL_IN_PROG;
         }
         if (local_slot.status != NIXL_SUCCESS) {
+            if (local_slot.status == NIXL_ERR_BACKEND) {
+                NIXL_ERROR << "UCX staged TX pool permanently exhausted gpu_dev="
+                           << chunk.localGpuDev << " pool_epoch="
+                           << chunk.localPool->poolEpoch
+                           << " tx_slots=" << chunk.localPool->txCount;
+            }
             return local_slot.status;
         }
 
@@ -4592,6 +4603,12 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                 return NIXL_IN_PROG;
             }
             if (local_slot.status != NIXL_SUCCESS) {
+                if (local_slot.status == NIXL_ERR_BACKEND) {
+                    NIXL_ERROR << "UCX staged TX pool permanently exhausted gpu_dev="
+                               << chunk.localGpuDev << " pool_epoch="
+                               << chunk.localPool->poolEpoch
+                               << " tx_slots=" << chunk.localPool->txCount;
+                }
                 return local_slot.status;
             }
 

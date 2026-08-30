@@ -103,7 +103,9 @@ diffs minimal and flag anything non-mechanical):
     `ERROR` leases -> FREE (H2D already consumed the RDMA write; no outstanding writer);
     `REMOTE_RESERVED` older than `leaseTimeoutUs` -> `QUARANTINED` (log one NIXL_WARN with
     owner/transfer/chunk/lease). Then retry the FREE scan. A `QUARANTINED` slot is never
-    granted.
+    granted. If no FREE slot and no active `REMOTE_RESERVED`/`REMOTE_H2D` lease remain,
+    return `NIXL_ERR_BACKEND`: the pool is permanently exhausted until rebuild. Return
+    `NIXL_IN_PROG` only while active work can still release capacity.
   - **per-agent cap**: let `cap = maxGrantsPerAgent` (config §5). Refuse (return IN_PROG) a
     grant to agent X when X currently holds >= cap active RX grants (RESERVED+H2D) AND at least
     one other agent currently holds >= 1 active RX grant. Quarantine removes a lease from active
@@ -350,8 +352,9 @@ Cases (assert exact statuses, not just "doesn't crash"):
    still succeeds.
 2. Quarantine: fill RX, expire leases (inject clock or make `leaseTimeoutUs` tiny and the
    time-source injectable — prefer an injectable `now_us` functor, NOTE if you deviate),
-   `reserveRxSlot` -> the expired leases become QUARANTINED and the call still returns IN_PROG
-   (never a grant of a quarantined slot).
+   `reserveRxSlot` -> the expired leases become QUARANTINED and the call returns
+   `NIXL_ERR_BACKEND` when no active lease remains (never a grant of a quarantined slot).
+   Mixed active+quarantined pools still return `NIXL_IN_PROG` while capacity can recover.
 3. Late settle: quarantined lease + matching `beginRemoteH2D` is rejected and remains pinned.
 4. Late release: SLOT_RELEASE cannot free a quarantined lease.
 5. Owner disconnect: reserved leases for that owner become quarantined; never touch
