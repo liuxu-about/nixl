@@ -22,6 +22,8 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <atomic>
+#include <deque>
 #include <unordered_map>
 #include <vector>
 
@@ -82,7 +84,9 @@ public:
                           uint64_t lease_timeout_us,
                           size_t max_grants_per_agent,
                           Backing backing,
-                          NowUs now_us = {});
+                          NowUs now_us = {},
+                          uint64_t waiter_timeout_us = 1000000,
+                          bool fifo_admission = true);
 
     nixlUcxStagedSlotPool(const nixlUcxStagedSlotPool &) = delete;
     nixlUcxStagedSlotPool &
@@ -140,6 +144,51 @@ public:
     size_t
     quarantineLeasesForOwner(const std::string &owner_agent);
 
+    // Quarantine REMOTE_RESERVED leases older than leaseTimeoutUs and recycle
+    // ERROR leases. Called from the engine progress path so reclaim does not
+    // depend on an allocation failure. Returns the number of leases quarantined.
+    size_t
+    reclaimExpiredLeases();
+
+    // WRITE_READY idempotency: a lease that already finished H2D is remembered in
+    // a small ring so a retransmitted READY can be answered with the same ACK
+    // status instead of an error.
+    [[nodiscard]] bool
+    completedLeaseStatus(const std::string &owner_agent,
+                         uint64_t transfer_id,
+                         uint64_t chunk_id,
+                         uint64_t slot_id,
+                         uint64_t lease_id,
+                         nixl_status_t &status) const;
+
+    // True while the matching lease is in REMOTE_H2D: a duplicate READY must be
+    // dropped, the ACK for the copy in flight will follow.
+    [[nodiscard]] bool
+    leaseInProgress(const std::string &owner_agent,
+                    uint64_t transfer_id,
+                    uint64_t chunk_id,
+                    uint64_t slot_id,
+                    uint64_t lease_id) const;
+
+    [[nodiscard]] uint64_t
+    leasesExpired() const noexcept {
+        return leasesExpired_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] uint64_t
+    quotaWaits() const noexcept {
+        return quotaWaits_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] uint64_t
+    fifoWaits() const noexcept {
+        return fifoWaits_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] uint64_t
+    grantReplays() const noexcept {
+        return grantReplays_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] size_t
+    waiterCount() const;
+
     [[nodiscard]] bool
     hasLeasesForToken(uint64_t region_token) const;
 
@@ -172,6 +221,8 @@ public:
     const size_t rxCount;
     const uint64_t leaseTimeoutUs;
     const size_t maxGrantsPerAgent;
+    const uint64_t waiterTimeoutUs;
+    const bool fifoAdmission;
     Backing backing;
 
 private:
@@ -207,6 +258,33 @@ private:
     [[nodiscard]] bool
     quotaBlocks(const std::string &owner_agent) const;
 
+    struct Waiter {
+        std::string ownerAgent;
+        uint64_t transferId = 0;
+        uint64_t chunkId = 0;
+        uint64_t lastSeenUs = 0;
+    };
+    struct CompletedLease {
+        std::string ownerAgent;
+        uint64_t transferId = 0;
+        uint64_t chunkId = 0;
+        uint64_t slotId = 0;
+        uint64_t leaseId = 0;
+        nixl_status_t status = NIXL_IN_PROG;
+    };
+    // Sized so a READY retransmit after ackTimeoutMs still finds its lease: at
+    // ~250 chunks/s per pool this covers ~16 s of completions.
+    static constexpr size_t kCompletedRingSize = 4096;
+
+    size_t
+    reclaimExpiredLeasesLocked(uint64_t now_us);
+    void
+    pruneWaitersLocked(uint64_t now_us);
+    [[nodiscard]] std::deque<Waiter>::iterator
+    findWaiterLocked(const std::string &owner_agent, uint64_t transfer_id, uint64_t chunk_id);
+    void
+    rememberCompletedLocked(const RxLease &lease, uint64_t slot_id, nixl_status_t status);
+
     mutable std::mutex mutex_;
     std::vector<nixlUcxStagedSlotState> txStates_;
     std::vector<uint64_t> txGenerations_;
@@ -215,6 +293,13 @@ private:
     uint64_t nextLeaseId_ = 1;
     NowUs nowUs_;
     QuarantineCallback quarantineCallback_;
+    std::deque<Waiter> waiters_;
+    std::vector<CompletedLease> completed_;
+    size_t completedNext_ = 0;
+    std::atomic<uint64_t> leasesExpired_{0};
+    std::atomic<uint64_t> quotaWaits_{0};
+    std::atomic<uint64_t> fifoWaits_{0};
+    std::atomic<uint64_t> grantReplays_{0};
 };
 
 #endif

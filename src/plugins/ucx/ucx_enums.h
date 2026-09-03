@@ -78,6 +78,7 @@ enum class am_cb_op_t {
     STAGED_WRITE_READY,
     STAGED_LOCAL_WRITE_READY,
     STAGED_ACK,
+    STAGED_CANCEL_ACK,
 };
 
 [[nodiscard]] constexpr std::string_view
@@ -97,6 +98,8 @@ toStringView(const am_cb_op_t t) noexcept {
         return "STAGED_LOCAL_WRITE_READY";
     case am_cb_op_t::STAGED_ACK:
         return "STAGED_ACK";
+    case am_cb_op_t::STAGED_CANCEL_ACK:
+        return "STAGED_CANCEL_ACK";
     }
     return nixl::ucx::invalid_string;
 }

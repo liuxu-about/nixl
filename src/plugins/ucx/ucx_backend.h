@@ -242,6 +242,18 @@ protected:
         // so the remaining half must cover the worst-case post-write RDMA + flush +
         // READY span.
         size_t leaseTimeoutMs = 60000;
+        // Control-plane deadlines (0 disables). A SLOT_REQ without GRANT within
+        // grantTimeoutMs, or a WRITE_READY without ACK within ackTimeoutMs, is
+        // retransmitted; the target answers retransmits idempotently. After
+        // maxAttempts the chunk fails and the transfer reports an error.
+        size_t grantTimeoutMs = 2000;
+        size_t ackTimeoutMs = 5000;
+        size_t maxAttempts = 5;
+        // Hand free RX slots to the oldest live waiter instead of the first poller.
+        // Off by default: with several prefill agents polling for 8 RX slots the
+        // head-of-queue rule leaves freed slots idle until that one waiter polls
+        // again, which cost ~20% throughput offline (3P1D C512: 61 vs 76 QPS).
+        bool fifoAdmission = false;
         bool localStaging = false;
         bool localStagingAutoEnabled = false;
         bool localStagingFallback = true;
@@ -350,6 +362,7 @@ private:
                       uintptr_t remote_gpu_addr,
                       uint64_t remote_gpu_dev,
                       size_t size,
+                      uint32_t attempt,
                       const std::unique_ptr<nixlUcxEp> &ep,
                       nixlUcxReq *req) const;
 
@@ -390,6 +403,7 @@ private:
                          uintptr_t remote_gpu_addr,
                          uint64_t remote_gpu_dev,
                          size_t size,
+                         uint32_t attempt,
                          const std::unique_ptr<nixlUcxEp> &ep,
                          nixlUcxReq *req) const;
 
@@ -422,7 +436,17 @@ private:
     handleStagedSlotReq(const nixl_blob_t &message, ucp_ep_h reply_ep = nullptr) const;
 
     nixl_status_t
-    handleStagedSlotRelease(const nixl_blob_t &message) const;
+    handleStagedSlotRelease(const nixl_blob_t &message, ucp_ep_h reply_ep = nullptr) const;
+    nixl_status_t
+    handleStagedCancelAck(const nixl_blob_t &message) const;
+    nixl_status_t
+    sendStagedCancelAck(const std::string &remote_agent,
+                        uint64_t transfer_id,
+                        uint64_t chunk_id,
+                        uint64_t slot_id,
+                        uint64_t lease_id,
+                        uint8_t result,
+                        ucp_ep_h reply_ep) const;
 
     nixl_status_t
     handleStagedWriteReady(const nixl_blob_t &message, ucp_ep_h reply_ep = nullptr) const;
@@ -540,6 +564,13 @@ private:
                   void *data,
                   size_t length,
                   const ucp_am_recv_param_t *param);
+    static ucs_status_t
+    stagedCancelAckAmCb(void *arg,
+                  const void *header,
+                  size_t header_length,
+                  void *data,
+                  size_t length,
+                  const ucp_am_recv_param_t *param);
 
     static VramStagingConfig
     makeVramStagingConfig(const nixl_b_params_t *custom_params);
@@ -610,6 +641,30 @@ private:
     mutable std::atomic<uint64_t> stagedProfileTargetBytes_{0};
     mutable std::atomic<uint64_t> stagedProfileTargetH2DUs_{0};
     mutable std::atomic<uint64_t> stagedProfileTargetCallbackUs_{0};
+    // Transport hardening counters (target side unless noted).
+    mutable std::atomic<uint64_t> stagedReadyReplays_{0};
+    mutable std::atomic<uint64_t> stagedReadyDuplicates_{0};
+    mutable std::atomic<uint64_t> stagedCancelAckReleased_{0};
+    mutable std::atomic<uint64_t> stagedCancelAckQuarantined_{0};
+    mutable std::atomic<uint64_t> stagedCancelAckUnknown_{0};
+    mutable std::atomic<uint64_t> stagedCancelsSent_{0};
+    mutable std::atomic<uint64_t> stagedFaultDrops_{0};
+    mutable std::atomic<uint64_t> stagedLastReclaimUs_{0};
+    struct StagedFaultConfig {
+        bool enabled = false;
+        double dropGrant = 0.0;
+        double dropAck = 0.0;
+        double dropCancelAck = 0.0;
+        double dropSlotReq = 0.0;
+        double dropReady = 0.0;
+    };
+    StagedFaultConfig stagedFault_;
+    [[nodiscard]] static StagedFaultConfig
+    parseStagedFaultConfig(const std::string &spec);
+    [[nodiscard]] bool
+    stagedFaultDrop(double probability, const char *what) const;
+    void
+    reclaimStagedLeases() const;
     mutable std::atomic<uint64_t> stagedProfileLocalReadyCount_{0};
     mutable std::atomic<uint64_t> stagedProfileLocalErrors_{0};
     mutable std::atomic<uint64_t> stagedProfileLocalBytes_{0};

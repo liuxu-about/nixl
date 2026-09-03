@@ -451,6 +451,12 @@ namespace {
 
 constexpr std::string_view kUcxStagedMagic = "NIXL_UCX_STAGED_V2";
 
+// CANCEL_ACK results reported by the target for a SLOT_RELEASE.
+constexpr uint8_t kStagedCancelReleased = 0;
+constexpr uint8_t kStagedCancelQuarantined = 1;
+constexpr uint8_t kStagedCancelUnknown = 2;
+constexpr uint8_t kStagedCancelInProgress = 3;
+
 struct nixlUcxStagedProfile {
     uint64_t slotReqSent = 0;
     uint64_t slotGrantSuccess = 0;
@@ -458,6 +464,8 @@ struct nixlUcxStagedProfile {
     uint64_t localSlotMiss = 0;
     uint64_t remoteWindowMiss = 0;
     uint64_t staleGrantReleases = 0;
+    uint64_t grantRetries = 0;
+    uint64_t readyRetries = 0;
     uint64_t localSharedChunks = 0;
     uint64_t localSharedBytes = 0;
     uint64_t localSharedAckErrors = 0;
@@ -676,6 +684,17 @@ struct nixlUcxStagedChunk {
     uint64_t readyPostedUs = 0;
     uint64_t ackWaitStartUs = 0;
     std::atomic<uint64_t> ackArrivedUs{0};
+    // Retransmit bookkeeping. grantAttempt/readyAttempt count the SLOT_REQ and
+    // WRITE_READY sends of the current grant cycle; lastSlotReqUs is the deadline
+    // base for GRANT retransmits (slotReqPostedUs stays the stale-grant base).
+    uint32_t grantAttempt = 0;
+    uint32_t readyAttempt = 0;
+    uint64_t lastSlotReqUs = 0;
+    // True from SLOT_REQ send until the grant is consumed by the state machine.
+    // A GRANT arriving while it is false is a duplicate or a late reply for a
+    // grant cycle that was abandoned; markGrant ignores same-lease duplicates and
+    // reports foreign leases so the caller returns them.
+    std::atomic<bool> grantWanted{false};
 };
 
 struct nixlUcxStagedFlushBatch {
@@ -769,6 +788,19 @@ public:
         }
 
         auto &chunk = *chunks[chunk_id];
+        if (!chunk.grantWanted.load() || chunk.grantArrived.load()) {
+            // Duplicate or late GRANT (retransmitted SLOT_REQ answered twice, or a
+            // reply for an abandoned grant cycle). The same lease needs nothing;
+            // a different successful lease is unbound and must be returned.
+            duplicateGrants.fetch_add(1, std::memory_order_relaxed);
+            if (status == NIXL_SUCCESS && lease_id != chunk.leaseId.load()) {
+                NIXL_WARN << "Returning unbound UCX staged SLOT_GRANT transfer_id="
+                          << transferId << " chunk_id=" << chunk_id << " lease_id="
+                          << lease_id << " bound_lease_id=" << chunk.leaseId.load();
+                return false;
+            }
+            return true;
+        }
         epoch_mismatch =
             pool_epoch != 0 && chunk.remoteMetadata && chunk.remoteMetadata->remotePool &&
             pool_epoch != chunk.remoteMetadata->remotePool->poolEpoch;
@@ -863,6 +895,7 @@ public:
     std::unique_ptr<nixlUcxStagedFlushBatch> openFlushBatch;
     std::unordered_map<uint64_t, SourceD2HStreams> sourceD2HStreams;
     nixlUcxStagedProfile profile;
+    std::atomic<uint64_t> duplicateGrants{0};
     bool profileLogged = false;
     bool pendingRegistered = false;
     State state = State::INIT;
@@ -1525,6 +1558,14 @@ nixlUcxEngine::makeVramStagingConfig(const nixl_b_params_t *custom_params) {
         custom_params, nixl_ucx_staging_source_d2h_prefetch_param_name, config.sourceD2HPrefetch);
     config.leaseTimeoutMs = nixl_b_params_get_size(
         custom_params, nixl_ucx_staging_lease_timeout_param_name, config.leaseTimeoutMs);
+    config.grantTimeoutMs = nixl_b_params_get_size(
+        custom_params, nixl_ucx_staging_grant_timeout_param_name, config.grantTimeoutMs);
+    config.ackTimeoutMs = nixl_b_params_get_size(
+        custom_params, nixl_ucx_staging_ack_timeout_param_name, config.ackTimeoutMs);
+    config.maxAttempts = nixl_b_params_get_size(
+        custom_params, nixl_ucx_staging_max_attempts_param_name, config.maxAttempts);
+    config.fifoAdmission = nixl_b_params_get_bool(
+        custom_params, nixl_ucx_staging_fifo_admission_param_name, config.fifoAdmission);
     config.localStaging = nixl_b_params_get_bool(
         custom_params, nixl_ucx_vram_local_staging_param_name, config.localStaging);
     config.localStagingFallback = nixl_b_params_get_bool(custom_params,
@@ -1565,6 +1606,27 @@ nixlUcxEngine::makeVramStagingConfig(const nixl_b_params_t *custom_params) {
                           config.sourceD2HPrefetch);
     config.leaseTimeoutMs =
         nixl_env_get_size(nixl_ucx_staging_lease_timeout_env_name, config.leaseTimeoutMs);
+    config.grantTimeoutMs =
+        nixl_env_get_size(nixl_ucx_staging_grant_timeout_env_name, config.grantTimeoutMs);
+    config.ackTimeoutMs =
+        nixl_env_get_size(nixl_ucx_staging_ack_timeout_env_name, config.ackTimeoutMs);
+    config.maxAttempts =
+        nixl_env_get_size(nixl_ucx_staging_max_attempts_env_name, config.maxAttempts);
+    config.fifoAdmission =
+        nixl_env_get_bool(nixl_ucx_staging_fifo_admission_env_name, config.fifoAdmission);
+    if (config.maxAttempts == 0) {
+        config.maxAttempts = 1;
+    }
+    // The stale-grant guard refuses grants older than leaseTimeoutMs / 2, so the
+    // whole retransmit budget must fit under it or every retried grant is
+    // discarded on arrival and the target quarantines the lease instead.
+    if (config.leaseTimeoutMs != 0 && config.grantTimeoutMs != 0 &&
+        config.grantTimeoutMs * config.maxAttempts >= config.leaseTimeoutMs / 2) {
+        NIXL_WARN << "UCX staging grant_timeout_ms * max_attempts ("
+                  << config.grantTimeoutMs * config.maxAttempts
+                  << ") is not below lease_timeout_ms / 2 (" << config.leaseTimeoutMs / 2
+                  << "); retried grants may be treated as stale";
+    }
     config.localStaging =
         nixl_env_get_bool(nixl_ucx_vram_local_staging_env_name, config.localStaging);
     config.localStagingFallback =
@@ -1638,6 +1700,15 @@ nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params)
                       stagedLocalWriteReadyAmCb,
                       this);
     uw->regAmCallback(nixl::ucx::am_cb_op_t::STAGED_ACK, stagedAckAmCb, this);
+    uw->regAmCallback(nixl::ucx::am_cb_op_t::STAGED_CANCEL_ACK, stagedCancelAckAmCb, this);
+    stagedFault_ = parseStagedFaultConfig(envString(nixl_ucx_staging_fault_env_name, ""));
+    if (stagedFault_.enabled) {
+        NIXL_WARN << "UCX staged fault injection enabled: drop_grant=" << stagedFault_.dropGrant
+                  << " drop_ack=" << stagedFault_.dropAck
+                  << " drop_cancel_ack=" << stagedFault_.dropCancelAck
+                  << " drop_slot_req=" << stagedFault_.dropSlotReq
+                  << " drop_ready=" << stagedFault_.dropReady;
+    }
 
     if (vramStagingConfig_.enabled) {
         if (vramStagingConfig_.localStagingAutoEnabled) {
@@ -1654,6 +1725,10 @@ nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params)
                   << " target_h2d_worker=" << vramStagingConfig_.targetH2DWorker
                   << " source_d2h_prefetch=" << vramStagingConfig_.sourceD2HPrefetch
                   << " lease_timeout_ms=" << vramStagingConfig_.leaseTimeoutMs
+                  << " grant_timeout_ms=" << vramStagingConfig_.grantTimeoutMs
+                  << " ack_timeout_ms=" << vramStagingConfig_.ackTimeoutMs
+                  << " max_attempts=" << vramStagingConfig_.maxAttempts
+                  << " fifo_admission=" << vramStagingConfig_.fifoAdmission
                   << " local_staging=" << vramStagingConfig_.localStaging
                   << " local_staging_fallback=" << vramStagingConfig_.localStagingFallback
                   << " local_staging_shm_dir=" << vramStagingConfig_.localStagingShmDir
@@ -1747,6 +1822,91 @@ nixlUcxEngine::~nixlUcxEngine() {
     }
 
     tlsSharedWorkerMap().erase(this);
+}
+
+nixlUcxEngine::StagedFaultConfig
+nixlUcxEngine::parseStagedFaultConfig(const std::string &spec) {
+    StagedFaultConfig config;
+    size_t pos = 0;
+    while (pos < spec.size()) {
+        size_t next = spec.find(',', pos);
+        if (next == std::string::npos) {
+            next = spec.size();
+        }
+        const std::string item = spec.substr(pos, next - pos);
+        pos = next + 1;
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        const std::string key = item.substr(0, eq);
+        double value = 0.0;
+        try {
+            value = std::stod(item.substr(eq + 1));
+        }
+        catch (const std::exception &) {
+            continue;
+        }
+        if (key == "drop_grant") {
+            config.dropGrant = value;
+        } else if (key == "drop_ack") {
+            config.dropAck = value;
+        } else if (key == "drop_cancel_ack") {
+            config.dropCancelAck = value;
+        } else if (key == "drop_slot_req") {
+            config.dropSlotReq = value;
+        } else if (key == "drop_ready") {
+            config.dropReady = value;
+        }
+    }
+    config.enabled = config.dropGrant > 0 || config.dropAck > 0 || config.dropCancelAck > 0 ||
+        config.dropSlotReq > 0 || config.dropReady > 0;
+    return config;
+}
+
+bool
+nixlUcxEngine::stagedFaultDrop(double probability, const char *what) const {
+    if (!stagedFault_.enabled || probability <= 0.0) {
+        return false;
+    }
+    thread_local std::mt19937_64 rng{std::random_device{}()};
+    thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);
+    if (dist(rng) >= probability) {
+        return false;
+    }
+    stagedFaultDrops_.fetch_add(1, std::memory_order_relaxed);
+    NIXL_WARN << "[STAGED_FAULT] dropping UCX staged " << what;
+    return true;
+}
+
+void
+nixlUcxEngine::reclaimStagedLeases() const {
+    if (!vramStagingConfig_.enabled || vramStagingConfig_.leaseTimeoutMs == 0) {
+        return;
+    }
+    constexpr uint64_t reclaim_interval_us = 100000;
+    const uint64_t now_us = profileNowUs();
+    uint64_t last_us = stagedLastReclaimUs_.load(std::memory_order_relaxed);
+    if (now_us - last_us < reclaim_interval_us ||
+        !stagedLastReclaimUs_.compare_exchange_strong(last_us, now_us)) {
+        return;
+    }
+    std::vector<nixlUcxStagedSlotPool *> pools;
+    {
+        const std::lock_guard lock(stagedPoolMutex_);
+        pools.reserve(stagedPools_.size());
+        for (const auto &[dev, pool] : stagedPools_) {
+            pools.push_back(pool.get());
+        }
+    }
+    for (auto *pool : pools) {
+        const size_t reclaimed = pool->reclaimExpiredLeases();
+        if (reclaimed != 0) {
+            NIXL_WARN << "UCX staged lease reclaim quarantined " << reclaimed
+                      << " expired lease(s) gpu_dev=" << pool->gpuDevId
+                      << " pool_epoch=" << pool->poolEpoch;
+        }
+    }
 }
 
 void
@@ -2139,7 +2299,13 @@ nixlUcxEngine::stagedH2DWorkerLoop() const {
                           << " h2d_total_us=" << total_h2d_us
                           << " h2d_avg_us=" << (total_h2d_us / ready_count)
                           << " callback_total_us=" << total_callback_us
-                          << " callback_avg_us=" << (total_callback_us / ready_count);
+                          << " callback_avg_us=" << (total_callback_us / ready_count)
+                          << " ready_replays=" << stagedReadyReplays_.load()
+                          << " ready_dups=" << stagedReadyDuplicates_.load()
+                          << " cancel_ack_released=" << stagedCancelAckReleased_.load()
+                          << " cancel_ack_quarantined=" << stagedCancelAckQuarantined_.load()
+                          << " cancel_ack_unknown=" << stagedCancelAckUnknown_.load()
+                          << " fault_drops=" << stagedFaultDrops_.load();
             }
         }
     };
@@ -2552,7 +2718,10 @@ nixlUcxEngine::ensureStagedPool(uint64_t gpu_dev, nixlUcxStagedSlotPool *&pool) 
         vramStagingConfig_.rxSlots,
         static_cast<uint64_t>(vramStagingConfig_.leaseTimeoutMs) * 1000,
         vramStagingConfig_.maxGrantsPerAgent,
-        std::move(backing));
+        std::move(backing),
+        nixlUcxStagedSlotPool::NowUs{},
+        1000000,
+        vramStagingConfig_.fifoAdmission);
     created->setQuarantineCallback(
         [gpu_dev](size_t slot_id,
                   const std::string &owner,
@@ -3047,8 +3216,12 @@ nixlUcxEngine::sendStagedSlotReq(const std::string &remote_agent,
                                  uintptr_t remote_gpu_addr,
                                  uint64_t remote_gpu_dev,
                                  size_t size,
+                                 uint32_t attempt,
                                  const std::unique_ptr<nixlUcxEp> &ep,
                                  nixlUcxReq *req) const {
+    if (stagedFaultDrop(stagedFault_.dropSlotReq, "SLOT_REQ")) {
+        return NIXL_SUCCESS;
+    }
     nixlSerDes ser_des;
 
     ser_des.addStr("name", localAgent);
@@ -3058,6 +3231,7 @@ nixlUcxEngine::sendStagedSlotReq(const std::string &remote_agent,
     ser_des.addBuf("gpu_addr", &remote_gpu_addr, sizeof(remote_gpu_addr));
     ser_des.addBuf("gpu_dev", &remote_gpu_dev, sizeof(remote_gpu_dev));
     ser_des.addBuf("size", &size, sizeof(size));
+    ser_des.addBuf("attempt", &attempt, sizeof(attempt));
 
     std::string *buffer = new std::string(ser_des.exportStr());
     auto deleter = [buffer, req](void *completed_request, void *ptr) {
@@ -3069,7 +3243,7 @@ nixlUcxEngine::sendStagedSlotReq(const std::string &remote_agent,
 
     NIXL_TRACE << "Sending UCX staged SLOT_REQ transfer_id=" << transfer_id
                << " chunk_id=" << chunk_id << " remote_agent=" << remote_agent
-               << " bytes=" << size;
+               << " bytes=" << size << " attempt=" << attempt;
 
     return ep->sendAm(nixl::ucx::am_cb_op_t::STAGED_SLOT_REQ,
                       nullptr,
@@ -3099,6 +3273,9 @@ nixlUcxEngine::sendStagedSlotGrant(const std::string &remote_agent,
     ser_des.addBuf("pool_epoch", &pool_epoch, sizeof(pool_epoch));
     ser_des.addBuf("status", &status, sizeof(status));
 
+    if (stagedFaultDrop(stagedFault_.dropGrant, "SLOT_GRANT")) {
+        return NIXL_SUCCESS;
+    }
     std::string *buffer = new std::string(ser_des.exportStr());
 
     NIXL_TRACE << "Sending UCX staged SLOT_GRANT transfer_id=" << transfer_id
@@ -3145,6 +3322,9 @@ nixlUcxEngine::sendStagedSlotRelease(const std::string &remote_agent,
     ser_des.addBuf("gpu_dev", &remote_gpu_dev, sizeof(remote_gpu_dev));
     ser_des.addBuf("size", &size, sizeof(size));
     const uint8_t release_kind = static_cast<uint8_t>(kind);
+    if (kind == nixlUcxStagedSlotReleaseKind::SAFE_CANCEL) {
+        stagedCancelsSent_.fetch_add(1, std::memory_order_relaxed);
+    }
     ser_des.addBuf("release_kind", &release_kind, sizeof(release_kind));
 
     std::string *buffer = new std::string(ser_des.exportStr());
@@ -3164,7 +3344,7 @@ nixlUcxEngine::sendStagedSlotRelease(const std::string &remote_agent,
                                   0,
                                   (void *)buffer->data(),
                                   buffer->size(),
-                                  UCP_AM_SEND_FLAG_EAGER,
+                                  UCP_AM_SEND_FLAG_EAGER | UCP_AM_SEND_FLAG_REPLY,
                                   nullptr,
                                   deleter);
 }
@@ -3178,8 +3358,12 @@ nixlUcxEngine::sendStagedWriteReady(const std::string &remote_agent,
                                     uintptr_t remote_gpu_addr,
                                     uint64_t remote_gpu_dev,
                                     size_t size,
+                                    uint32_t attempt,
                                     const std::unique_ptr<nixlUcxEp> &ep,
                                     nixlUcxReq *req) const {
+    if (stagedFaultDrop(stagedFault_.dropReady, "WRITE_READY")) {
+        return NIXL_SUCCESS;
+    }
     nixlSerDes ser_des;
 
     ser_des.addStr("name", localAgent);
@@ -3190,6 +3374,7 @@ nixlUcxEngine::sendStagedWriteReady(const std::string &remote_agent,
     ser_des.addBuf("gpu_addr", &remote_gpu_addr, sizeof(remote_gpu_addr));
     ser_des.addBuf("gpu_dev", &remote_gpu_dev, sizeof(remote_gpu_dev));
     ser_des.addBuf("size", &size, sizeof(size));
+    ser_des.addBuf("attempt", &attempt, sizeof(attempt));
 
     std::string *buffer = new std::string(ser_des.exportStr());
     auto deleter = [buffer, req](void *completed_request, void *ptr) {
@@ -3202,7 +3387,7 @@ nixlUcxEngine::sendStagedWriteReady(const std::string &remote_agent,
     NIXL_TRACE << "Sending UCX staged WRITE_READY transfer_id=" << transfer_id
                << " chunk_id=" << chunk_id << " remote_agent=" << remote_agent
                << " slot_id=" << remote_slot_id << " lease_id=" << lease_id
-               << " bytes=" << size;
+               << " bytes=" << size << " attempt=" << attempt;
 
     return ep->sendAm(nixl::ucx::am_cb_op_t::STAGED_WRITE_READY,
                       nullptr,
@@ -3284,6 +3469,9 @@ nixlUcxEngine::sendStagedAck(const std::string &remote_agent,
     ser_des.addBuf("lease_id", &lease_id, sizeof(lease_id));
     ser_des.addBuf("status", &status, sizeof(status));
 
+    if (stagedFaultDrop(stagedFault_.dropAck, "ACK")) {
+        return NIXL_SUCCESS;
+    }
     std::string *buffer = new std::string(ser_des.exportStr());
 
     NIXL_TRACE << "Sending UCX staged ACK transfer_id=" << transfer_id
@@ -3300,6 +3488,77 @@ nixlUcxEngine::sendStagedAck(const std::string &remote_agent,
                    << " transfer_id=" << transfer_id << " chunk_id=" << chunk_id;
     }
     return send_status;
+}
+
+nixl_status_t
+nixlUcxEngine::sendStagedCancelAck(const std::string &remote_agent,
+                                   uint64_t transfer_id,
+                                   uint64_t chunk_id,
+                                   uint64_t slot_id,
+                                   uint64_t lease_id,
+                                   uint8_t result,
+                                   ucp_ep_h reply_ep) const {
+    nixlSerDes ser_des;
+    ser_des.addStr("name", localAgent);
+    ser_des.addBuf("xfer_id", &transfer_id, sizeof(transfer_id));
+    ser_des.addBuf("chunk_id", &chunk_id, sizeof(chunk_id));
+    ser_des.addBuf("slot_id", &slot_id, sizeof(slot_id));
+    ser_des.addBuf("lease_id", &lease_id, sizeof(lease_id));
+    ser_des.addBuf("result", &result, sizeof(result));
+    if (stagedFaultDrop(stagedFault_.dropCancelAck, "CANCEL_ACK")) {
+        return NIXL_SUCCESS;
+    }
+    std::string *buffer = new std::string(ser_des.exportStr());
+    NIXL_TRACE << "Sending UCX staged CANCEL_ACK transfer_id=" << transfer_id
+               << " chunk_id=" << chunk_id << " remote_agent=" << remote_agent
+               << " slot_id=" << slot_id << " lease_id=" << lease_id
+               << " result=" << static_cast<unsigned>(result);
+    return sendStagedControlAm(
+        remote_agent, reply_ep, nixl::ucx::am_cb_op_t::STAGED_CANCEL_ACK, buffer);
+}
+
+nixl_status_t
+nixlUcxEngine::handleStagedCancelAck(const nixl_blob_t &message) const {
+    nixlSerDes ser_des;
+    if (ser_des.importStr(message) != NIXL_SUCCESS) {
+        NIXL_ERROR << "Failed to deserialize UCX staged CANCEL_ACK message";
+        return NIXL_ERR_MISMATCH;
+    }
+    const std::string remote_agent = ser_des.getStr("name");
+    uint64_t transfer_id = 0;
+    uint64_t chunk_id = 0;
+    uint64_t slot_id = 0;
+    uint64_t lease_id = 0;
+    uint8_t result = kStagedCancelUnknown;
+    if (remote_agent.empty() ||
+        ser_des.getBuf("xfer_id", &transfer_id, sizeof(transfer_id)) != NIXL_SUCCESS ||
+        ser_des.getBuf("chunk_id", &chunk_id, sizeof(chunk_id)) != NIXL_SUCCESS ||
+        ser_des.getBuf("slot_id", &slot_id, sizeof(slot_id)) != NIXL_SUCCESS ||
+        ser_des.getBuf("lease_id", &lease_id, sizeof(lease_id)) != NIXL_SUCCESS ||
+        ser_des.getBuf("result", &result, sizeof(result)) != NIXL_SUCCESS) {
+        NIXL_ERROR << "Malformed UCX staged CANCEL_ACK message";
+        return NIXL_ERR_MISMATCH;
+    }
+    switch (result) {
+    case kStagedCancelReleased:
+        stagedCancelAckReleased_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case kStagedCancelQuarantined:
+        stagedCancelAckQuarantined_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case kStagedCancelInProgress:
+        // SAFE_CANCEL reached the target after H2D started: the lease completes
+        // on its own and is freed by finishRemoteLease; nothing is lost.
+        stagedCancelAckReleased_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    default:
+        stagedCancelAckUnknown_.fetch_add(1, std::memory_order_relaxed);
+        NIXL_WARN << "UCX staged CANCEL_ACK reports unknown lease transfer_id=" << transfer_id
+                  << " chunk_id=" << chunk_id << " slot_id=" << slot_id
+                  << " lease_id=" << lease_id << " remote_agent=" << remote_agent;
+        break;
+    }
+    return NIXL_SUCCESS;
 }
 
 nixl_status_t
@@ -3400,7 +3659,7 @@ nixlUcxEngine::handleStagedSlotReq(const nixl_blob_t &message, ucp_ep_h reply_ep
 }
 
 nixl_status_t
-nixlUcxEngine::handleStagedSlotRelease(const nixl_blob_t &message) const {
+nixlUcxEngine::handleStagedSlotRelease(const nixl_blob_t &message, ucp_ep_h reply_ep) const {
     nixlSerDes ser_des;
     if (ser_des.importStr(message) != NIXL_SUCCESS) {
         NIXL_ERROR << "Failed to deserialize UCX staged SLOT_RELEASE message";
@@ -3445,6 +3704,7 @@ nixlUcxEngine::handleStagedSlotRelease(const nixl_blob_t &message) const {
         return NIXL_ERR_MISMATCH;
     }
 
+    bool lease_in_progress = false;
     if (status == NIXL_SUCCESS) {
         // size == 0 marks a release-by-id: the initiator no longer knows the gpu range
         // (e.g. the transfer was released before the grant arrived), so try every pool.
@@ -3476,6 +3736,9 @@ nixlUcxEngine::handleStagedSlotRelease(const nixl_blob_t &message) const {
                 status = NIXL_SUCCESS;
                 break;
             }
+            if (pool->leaseInProgress(remote_agent, transfer_id, chunk_id, slot_id, lease_id)) {
+                lease_in_progress = true;
+            }
             if (!by_id) {
                 status = NIXL_ERR_MISMATCH;
                 break;
@@ -3483,11 +3746,25 @@ nixlUcxEngine::handleStagedSlotRelease(const nixl_blob_t &message) const {
         }
     }
 
-    if (status != NIXL_SUCCESS) {
+    if (status != NIXL_SUCCESS && !lease_in_progress) {
         NIXL_WARN << "UCX staged SLOT_RELEASE did not match a lease transfer_id="
                   << transfer_id << " chunk_id=" << chunk_id << " slot_id=" << slot_id
                   << " lease_id=" << lease_id << " release_kind="
                   << static_cast<unsigned>(release_kind_raw) << " status=" << status;
+    }
+    uint8_t result = kStagedCancelUnknown;
+    if (status == NIXL_SUCCESS) {
+        result = release_kind == nixlUcxStagedSlotReleaseKind::SAFE_CANCEL ?
+            kStagedCancelReleased :
+            kStagedCancelQuarantined;
+    } else if (lease_in_progress) {
+        result = kStagedCancelInProgress;
+    }
+    const nixl_status_t ack_status = sendStagedCancelAck(
+        remote_agent, transfer_id, chunk_id, slot_id, lease_id, result, reply_ep);
+    if (ack_status != NIXL_SUCCESS && ack_status != NIXL_IN_PROG) {
+        NIXL_WARN << "Failed to send UCX staged CANCEL_ACK transfer_id=" << transfer_id
+                  << " chunk_id=" << chunk_id << " status=" << ack_status;
     }
     return status;
 }
@@ -3549,6 +3826,29 @@ nixlUcxEngine::handleStagedWriteReady(const nixl_blob_t &message, ucp_ep_h reply
                                      gpu_dev,
                                      size,
                                      ready);
+        if (status == NIXL_ERR_MISMATCH && h2d_pool != nullptr) {
+            // Retransmitted WRITE_READY. If the lease already finished, replay the
+            // ACK it produced; if the copy is still in flight, the pending ACK will
+            // answer both sends. Anything else is a real mismatch.
+            nixl_status_t completed_status = NIXL_IN_PROG;
+            if (h2d_pool->completedLeaseStatus(
+                    remote_agent, transfer_id, chunk_id, slot_id, lease_id, completed_status)) {
+                stagedReadyReplays_.fetch_add(1, std::memory_order_relaxed);
+                NIXL_WARN << "Replaying UCX staged ACK for retransmitted WRITE_READY "
+                          << "transfer_id=" << transfer_id << " chunk_id=" << chunk_id
+                          << " slot_id=" << slot_id << " lease_id=" << lease_id
+                          << " status=" << completed_status;
+                return sendStagedAck(
+                    remote_agent, transfer_id, chunk_id, lease_id, completed_status, reply_ep);
+            }
+            if (h2d_pool->leaseInProgress(remote_agent, transfer_id, chunk_id, slot_id, lease_id)) {
+                stagedReadyDuplicates_.fetch_add(1, std::memory_order_relaxed);
+                NIXL_WARN << "Ignoring duplicate UCX staged WRITE_READY with H2D in flight "
+                          << "transfer_id=" << transfer_id << " chunk_id=" << chunk_id
+                          << " slot_id=" << slot_id << " lease_id=" << lease_id;
+                return NIXL_SUCCESS;
+            }
+        }
         if (status == NIXL_SUCCESS) {
             region_token = h2d_pool->rxRegionToken(slot_id);
         }
@@ -3623,7 +3923,13 @@ nixlUcxEngine::handleStagedWriteReady(const nixl_blob_t &message, ucp_ep_h reply
                       << " h2d_total_us=" << total_h2d_us
                       << " h2d_avg_us=" << (total_h2d_us / ready_count)
                       << " callback_total_us=" << total_callback_us
-                      << " callback_avg_us=" << (total_callback_us / ready_count);
+                      << " callback_avg_us=" << (total_callback_us / ready_count)
+                      << " ready_replays=" << stagedReadyReplays_.load()
+                      << " ready_dups=" << stagedReadyDuplicates_.load()
+                      << " cancel_ack_released=" << stagedCancelAckReleased_.load()
+                      << " cancel_ack_quarantined=" << stagedCancelAckQuarantined_.load()
+                      << " cancel_ack_unknown=" << stagedCancelAckUnknown_.load()
+                      << " fault_drops=" << stagedFaultDrops_.load();
         }
     }
 
@@ -4328,16 +4634,26 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                   << " d2h_us=" << staged_handle->profile.d2hUs
                   << " rdma_flush_wait_us=" << staged_handle->profile.rdmaFlushWaitUs
                   << " ready_wait_us=" << staged_handle->profile.readyWaitUs
-                  << " ack_wait_us=" << staged_handle->profile.ackWaitUs;
+                  << " ack_wait_us=" << staged_handle->profile.ackWaitUs
+                  << " grant_retries=" << staged_handle->profile.grantRetries
+                  << " ready_retries=" << staged_handle->profile.readyRetries
+                  << " duplicate_grants=" << staged_handle->duplicateGrants.load()
+                  << " cancels_sent=" << stagedCancelsSent_.load()
+                  << " cancel_ack_released=" << stagedCancelAckReleased_.load()
+                  << " cancel_ack_quarantined=" << stagedCancelAckQuarantined_.load()
+                  << " cancel_ack_unknown=" << stagedCancelAckUnknown_.load()
+                  << " fault_drops=" << stagedFaultDrops_.load();
     };
 
-    auto send_slot_request = [&](nixlUcxStagedChunk &chunk) -> nixl_status_t {
-        if (!chunk.remoteMetadata || !chunk.remoteMetadata->remotePool ||
-            !chunk.remoteMetadata->remotePool->tryAcquireSlotWindow()) {
-            ++staged_handle->profile.remoteWindowMiss;
-            return NIXL_IN_PROG;
+    auto post_slot_request = [&](nixlUcxStagedChunk &chunk, bool retry) -> nixl_status_t {
+        if (!retry) {
+            if (!chunk.remoteMetadata || !chunk.remoteMetadata->remotePool ||
+                !chunk.remoteMetadata->remotePool->tryAcquireSlotWindow()) {
+                ++staged_handle->profile.remoteWindowMiss;
+                return NIXL_IN_PROG;
+            }
+            chunk.remoteWindowHeld = true;
         }
-        chunk.remoteWindowHeld = true;
 
         const auto conn = getConnection(staged_handle->remoteAgent);
         if (!conn) {
@@ -4347,10 +4663,18 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
 
         chunk.grantArrived.store(false);
         chunk.grantStatus.store(NIXL_IN_PROG);
-        // Stamp before the send: grant_is_stale assumes this time precedes the
-        // target's grant timestamp, which only holds if it is taken before the
-        // SLOT_REQ leaves this process.
-        chunk.slotReqPostedUs = profileNowUs();
+        chunk.grantWanted.store(true);
+        const uint64_t now_us = profileNowUs();
+        if (!retry) {
+            chunk.grantAttempt = 0;
+            // Stamp before the send: grant_is_stale assumes this time precedes the
+            // target's grant timestamp, which only holds if it is taken before the
+            // SLOT_REQ leaves this process.
+            chunk.slotReqPostedUs = now_us;
+        } else {
+            ++chunk.grantAttempt;
+        }
+        chunk.lastSlotReqUs = now_us;
 
         nixlUcxReq req = nullptr;
         const nixl_status_t send_status =
@@ -4361,11 +4685,14 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                               chunk.remoteGpuAddr,
                               chunk.remoteGpuDev,
                               chunk.size,
+                              chunk.grantAttempt,
                               conn->getEp(staged_handle->getWorkerId()),
                               &req);
         const nixl_status_t append_status = chunk.req->append(send_status, req, conn);
         if (append_status != NIXL_SUCCESS) {
             chunk.slotReqPostedUs = 0;
+            chunk.lastSlotReqUs = 0;
+            chunk.grantWanted.store(false);
             staged_handle->releaseRemoteWindow(chunk);
             return append_status;
         }
@@ -4373,6 +4700,9 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
         ++staged_handle->profile.slotReqSent;
         chunk.state = nixlUcxStagedChunk::State::SLOT_REQ_POSTED;
         return NIXL_SUCCESS;
+    };
+    auto send_slot_request = [&](nixlUcxStagedChunk &chunk) -> nixl_status_t {
+        return post_slot_request(chunk, false);
     };
 
     auto get_source_d2h_stream = [&](uint64_t gpu_dev, cudaStream_t &stream) -> nixl_status_t {
@@ -4521,6 +4851,11 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
     // sides are assumed to run with the same staging_lease_timeout_ms. This narrows,
     // but cannot fully close, the corruption window: a process frozen after the RDMA
     // write was posted can still write into a reclaimed slot.
+    const uint64_t grant_timeout_us =
+        static_cast<uint64_t>(vramStagingConfig_.grantTimeoutMs) * 1000;
+    const uint64_t ack_timeout_us = static_cast<uint64_t>(vramStagingConfig_.ackTimeoutMs) * 1000;
+    const uint32_t max_attempts =
+        static_cast<uint32_t>(std::max<size_t>(1, vramStagingConfig_.maxAttempts));
     const auto grant_is_stale = [&](const nixlUcxStagedChunk &chunk) -> bool {
         if (vramStagingConfig_.leaseTimeoutMs == 0 || chunk.slotReqPostedUs == 0) {
             return false;
@@ -4548,6 +4883,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
         staged_handle->releaseRemoteSlot(chunk);
         chunk.grantArrived.store(false);
         chunk.grantStatus.store(NIXL_IN_PROG);
+        chunk.grantWanted.store(false);
         chunk.leaseId = 0;
         if (vramStagingConfig_.sourceD2HPrefetch && chunk.localSlotHeld) {
             // Prefetched data in the local slot is still valid; only the remote
@@ -4583,6 +4919,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
             chunk.grantArrivedUs.store(0);
             chunk.leaseId.store(0);
         }
+        chunk.grantWanted.store(false);
     };
 
     auto start_granted_chunk = [&](nixlUcxStagedChunk &chunk) -> nixl_status_t {
@@ -4749,6 +5086,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
         ++staged_handle->profile.rdmaWritePosted;
 
         chunk.rdmaPostedUs = profileNowUs();
+        chunk.readyAttempt = 0;
         chunk.state = nixlUcxStagedChunk::State::RDMA_POSTED;
         return NIXL_SUCCESS;
     };
@@ -4769,6 +5107,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                                  chunk.remoteGpuAddr,
                                  chunk.remoteGpuDev,
                                  chunk.size,
+                                 chunk.readyAttempt,
                                  conn->getEp(staged_handle->getWorkerId()),
                                  &req);
         const nixl_status_t append_status = chunk.req->append(send_status, req, conn);
@@ -4994,8 +5333,37 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
 
                 if (chunk.state == nixlUcxStagedChunk::State::WAIT_SLOT_GRANT) {
                     if (!chunk.grantArrived.load()) {
+                        // GRANT deadline: retransmit the SLOT_REQ (the target answers
+                        // a repeated key with the same lease) until max_attempts.
+                        if (grant_timeout_us != 0 && chunk.lastSlotReqUs != 0 &&
+                            profileNowUs() - chunk.lastSlotReqUs >= grant_timeout_us) {
+                            if (chunk.grantAttempt + 1 >= max_attempts) {
+                                NIXL_ERROR << "[STAGED_GRANT_TIMEOUT] no SLOT_GRANT after "
+                                           << (chunk.grantAttempt + 1)
+                                           << " attempts transfer_id="
+                                           << staged_handle->transferId
+                                           << " chunk_id=" << chunk.id
+                                           << " remote_agent=" << staged_handle->remoteAgent
+                                           << " age_us="
+                                           << (profileNowUs() - chunk.slotReqPostedUs);
+                                chunk.state = nixlUcxStagedChunk::State::FAILED;
+                                return fail(NIXL_ERR_REMOTE_DISCONNECT);
+                            }
+                            ++staged_handle->profile.grantRetries;
+                            NIXL_WARN << "[STAGED_GRANT_RETRY] resending SLOT_REQ transfer_id="
+                                      << staged_handle->transferId << " chunk_id=" << chunk.id
+                                      << " attempt=" << (chunk.grantAttempt + 1)
+                                      << " remote_agent=" << staged_handle->remoteAgent;
+                            const nixl_status_t retry_status = post_slot_request(chunk, true);
+                            if (retry_status != NIXL_SUCCESS) {
+                                chunk.state = nixlUcxStagedChunk::State::FAILED;
+                                return fail(retry_status);
+                            }
+                            made_progress = true;
+                        }
                         continue;
                     }
+                    chunk.grantWanted.store(false);
 
                     const nixl_status_t grant_status = chunk.grantStatus.load();
                     if (grant_status == NIXL_IN_PROG) {
@@ -5087,6 +5455,40 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                 if (chunk.state == nixlUcxStagedChunk::State::WAIT_ACK) {
                     const nixl_status_t status = chunk.ackStatus.load();
                     if (status == NIXL_IN_PROG) {
+                        // ACK deadline: retransmit WRITE_READY (the target replays the
+                        // ACK of a finished lease and ignores one still in H2D). The
+                        // local shared-memory path has its own lease semantics and is
+                        // not retried here.
+                        if (ack_timeout_us != 0 && !chunk.localSharedWrite &&
+                            chunk.readyPostedUs != 0 &&
+                            profileNowUs() - chunk.readyPostedUs >= ack_timeout_us) {
+                            if (chunk.readyAttempt + 1 >= max_attempts) {
+                                NIXL_ERROR << "[STAGED_ACK_TIMEOUT] no ACK after "
+                                           << (chunk.readyAttempt + 1)
+                                           << " attempts transfer_id="
+                                           << staged_handle->transferId
+                                           << " chunk_id=" << chunk.id
+                                           << " slot_id=" << chunk.remoteSlotId
+                                           << " lease_id=" << chunk.leaseId.load()
+                                           << " remote_agent=" << staged_handle->remoteAgent;
+                                chunk.state = nixlUcxStagedChunk::State::FAILED;
+                                return fail(NIXL_ERR_REMOTE_DISCONNECT);
+                            }
+                            ++chunk.readyAttempt;
+                            ++staged_handle->profile.readyRetries;
+                            NIXL_WARN << "[STAGED_READY_RETRY] resending WRITE_READY transfer_id="
+                                      << staged_handle->transferId << " chunk_id=" << chunk.id
+                                      << " attempt=" << (chunk.readyAttempt + 1)
+                                      << " slot_id=" << chunk.remoteSlotId
+                                      << " lease_id=" << chunk.leaseId.load()
+                                      << " remote_agent=" << staged_handle->remoteAgent;
+                            const nixl_status_t retry_status = send_ready(chunk);
+                            if (retry_status != NIXL_SUCCESS) {
+                                chunk.state = nixlUcxStagedChunk::State::FAILED;
+                                return fail(retry_status);
+                            }
+                            made_progress = true;
+                        }
                         continue;
                     }
                     if (status != NIXL_SUCCESS) {
@@ -5353,6 +5755,7 @@ nixlUcxEngine::progress() {
     for (auto &uw : uws) {
         ret += uw->progress();
     }
+    reclaimStagedLeases();
     return ret;
 }
 
@@ -5507,7 +5910,9 @@ nixlUcxEngine::stagedSlotReleaseAmCb(void *arg,
     NIXL_ASSERT(header_length == 0) << "header_length " << header_length;
 
     const std::string ser_str((char *)data, length);
-    engine->handleStagedSlotRelease(ser_str);
+    const ucp_ep_h reply_ep =
+        (param->recv_attr & UCP_AM_RECV_ATTR_FIELD_REPLY_EP) ? param->reply_ep : nullptr;
+    engine->handleStagedSlotRelease(ser_str, reply_ep);
     return UCS_OK;
 }
 
@@ -5583,6 +5988,21 @@ nixlUcxEngine::stagedAckAmCb(void *arg,
     }
 
     engine->completePendingStagedReq(transfer_id, chunk_id, lease_id, status);
+    return UCS_OK;
+}
+
+ucs_status_t
+nixlUcxEngine::stagedCancelAckAmCb(void *arg,
+                                   const void *header,
+                                   size_t header_length,
+                                   void *data,
+                                   size_t length,
+                                   const ucp_am_recv_param_t *param) {
+    auto *engine = (nixlUcxEngine *)arg;
+    NIXL_ASSERT(!(param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV));
+    NIXL_ASSERT(header_length == 0) << "header_length " << header_length;
+    const std::string ser_str((char *)data, length);
+    engine->handleStagedCancelAck(ser_str);
     return UCS_OK;
 }
 

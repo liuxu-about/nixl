@@ -34,7 +34,8 @@ protected:
     makePool(size_t tx_count,
              size_t rx_count,
              uint64_t lease_timeout_us = 10,
-             size_t max_grants = 0) {
+             size_t max_grants = 0,
+             uint64_t waiter_timeout_us = 1000000) {
         slab_.assign((tx_count + rx_count) * kSlotStride, std::byte{0});
         nixlUcxStagedSlotPool::Backing backing{.base = slab_.data()};
         return std::make_unique<nixlUcxStagedSlotPool>(0,
@@ -46,7 +47,8 @@ protected:
                                                        lease_timeout_us,
                                                        max_grants,
                                                        std::move(backing),
-                                                       [this] { return nowUs_; });
+                                                       [this] { return nowUs_; },
+                                                       waiter_timeout_us);
     }
 
     static nixlUcxStagedSlotGrant
@@ -299,6 +301,167 @@ TEST_F(StagedPoolTest, TokenBookkeepingSurvivesReserveBeginAndQuarantine) {
     pool->finishRemoteLease(h2d.slotId, h2d.leaseId, NIXL_SUCCESS);
     EXPECT_FALSE(pool->hasLeasesForToken(41));
     EXPECT_TRUE(pool->hasLeasesForToken(42));
+}
+
+// --- transport hardening: idempotent control messages, reclaim, FIFO ---------
+
+TEST_F(StagedPoolTest, RepeatedSlotReqReplaysSameGrant) {
+    auto pool = makePool(0, 2);
+    const auto first = reserve(*pool, "peer", 1, 1);
+    ASSERT_EQ(first.status, NIXL_SUCCESS);
+    const auto again = reserve(*pool, "peer", 1, 1);
+    EXPECT_EQ(again.status, NIXL_SUCCESS);
+    EXPECT_EQ(again.slotId, first.slotId);
+    EXPECT_EQ(again.leaseId, first.leaseId);
+    EXPECT_EQ(pool->grantReplays(), 1u);
+    // The replay did not consume a second slot.
+    EXPECT_EQ(reserve(*pool, "peer", 1, 2).status, NIXL_SUCCESS);
+    EXPECT_EQ(reserve(*pool, "peer", 1, 3).status, NIXL_IN_PROG);
+}
+
+TEST_F(StagedPoolTest, RepeatedSlotReqAfterH2DStartedStillReplays) {
+    auto pool = makePool(0, 2);
+    const auto first = reserve(*pool, "peer", 1, 1);
+    ASSERT_EQ(first.status, NIXL_SUCCESS);
+    ASSERT_EQ(begin(*pool, "peer", 1, 1, first), NIXL_SUCCESS);
+    const auto again = reserve(*pool, "peer", 1, 1);
+    EXPECT_EQ(again.status, NIXL_SUCCESS);
+    EXPECT_EQ(again.slotId, first.slotId);
+    EXPECT_EQ(again.leaseId, first.leaseId);
+}
+
+TEST_F(StagedPoolTest, RetransmittedReadyReplaysCompletedStatus) {
+    auto pool = makePool(0, 2);
+    const auto ok = reserve(*pool, "peer", 1, 1);
+    ASSERT_EQ(begin(*pool, "peer", 1, 1, ok), NIXL_SUCCESS);
+    EXPECT_TRUE(pool->leaseInProgress("peer", 1, 1, ok.slotId, ok.leaseId));
+    nixl_status_t replay = NIXL_IN_PROG;
+    EXPECT_FALSE(pool->completedLeaseStatus("peer", 1, 1, ok.slotId, ok.leaseId, replay));
+    pool->finishRemoteLease(ok.slotId, ok.leaseId, NIXL_SUCCESS);
+    EXPECT_FALSE(pool->leaseInProgress("peer", 1, 1, ok.slotId, ok.leaseId));
+    EXPECT_TRUE(pool->completedLeaseStatus("peer", 1, 1, ok.slotId, ok.leaseId, replay));
+    EXPECT_EQ(replay, NIXL_SUCCESS);
+    // A second READY for the same lease is a mismatch for beginRemoteH2D ...
+    EXPECT_EQ(begin(*pool, "peer", 1, 1, ok), NIXL_ERR_MISMATCH);
+    // ... and the slot is free for the next key.
+    EXPECT_EQ(pool->rxState(ok.slotId), nixlUcxStagedSlotState::FREE);
+
+    const auto bad = reserve(*pool, "peer", 2, 1);
+    ASSERT_EQ(begin(*pool, "peer", 2, 1, bad), NIXL_SUCCESS);
+    pool->finishRemoteLease(bad.slotId, bad.leaseId, NIXL_ERR_BACKEND);
+    EXPECT_TRUE(pool->completedLeaseStatus("peer", 2, 1, bad.slotId, bad.leaseId, replay));
+    EXPECT_EQ(replay, NIXL_ERR_BACKEND);
+    // Wrong lease id or owner never matches.
+    EXPECT_FALSE(pool->completedLeaseStatus("peer", 2, 1, bad.slotId, bad.leaseId + 7, replay));
+    EXPECT_FALSE(pool->completedLeaseStatus("other", 2, 1, bad.slotId, bad.leaseId, replay));
+}
+
+TEST_F(StagedPoolTest, ExpiryRunsBeforeQuotaCheck) {
+    auto pool = makePool(0, 4, /*lease_timeout_us=*/10, /*max_grants=*/2);
+    EXPECT_EQ(reserve(*pool, "a", 1, 1).status, NIXL_SUCCESS);
+    EXPECT_EQ(reserve(*pool, "a", 1, 2).status, NIXL_SUCCESS);
+    EXPECT_EQ(reserve(*pool, "b", 9, 1).status, NIXL_SUCCESS);
+    // "a" is at its quota while "b" is active.
+    EXPECT_EQ(reserve(*pool, "a", 1, 3).status, NIXL_IN_PROG);
+    EXPECT_EQ(pool->quotaWaits(), 1u);
+    // Both of "a"'s grants expire: the reclaim must run before the quota check
+    // so the expired grants stop counting against "a".
+    nowUs_ += 11;
+    EXPECT_EQ(reserve(*pool, "a", 1, 3).status, NIXL_SUCCESS);
+    EXPECT_GE(pool->leasesExpired(), 2u);
+    EXPECT_EQ(pool->rxState(0), nixlUcxStagedSlotState::QUARANTINED);
+    EXPECT_EQ(pool->rxState(1), nixlUcxStagedSlotState::QUARANTINED);
+}
+
+TEST_F(StagedPoolTest, ReclaimExpiredLeasesRunsWithoutAllocationPressure) {
+    auto pool = makePool(0, 2, /*lease_timeout_us=*/10);
+    size_t callbacks = 0;
+    pool->setQuarantineCallback(
+        [&](size_t, const std::string &, uint64_t, uint64_t, uint64_t) { ++callbacks; });
+    const auto grant = reserve(*pool, "peer", 1, 1);
+    ASSERT_EQ(grant.status, NIXL_SUCCESS);
+    EXPECT_EQ(pool->reclaimExpiredLeases(), 0u);
+    nowUs_ += 11;
+    EXPECT_EQ(pool->reclaimExpiredLeases(), 1u);
+    EXPECT_EQ(callbacks, 1u);
+    EXPECT_EQ(pool->leasesExpired(), 1u);
+    EXPECT_EQ(pool->rxState(grant.slotId), nixlUcxStagedSlotState::QUARANTINED);
+    // Started H2D leases are never reclaimed by the timer.
+    const auto busy = reserve(*pool, "peer", 2, 1);
+    ASSERT_EQ(begin(*pool, "peer", 2, 1, busy), NIXL_SUCCESS);
+    nowUs_ += 100;
+    EXPECT_EQ(pool->reclaimExpiredLeases(), 0u);
+    EXPECT_EQ(pool->rxState(busy.slotId), nixlUcxStagedSlotState::REMOTE_H2D);
+}
+
+TEST_F(StagedPoolTest, FifoWaitersGetFreedSlotInArrivalOrder) {
+    auto pool = makePool(0, 1, /*lease_timeout_us=*/1000000);
+    const auto held = reserve(*pool, "a", 1, 1);
+    ASSERT_EQ(held.status, NIXL_SUCCESS);
+    EXPECT_EQ(reserve(*pool, "b", 2, 1).status, NIXL_IN_PROG);
+    nowUs_ += 1;
+    EXPECT_EQ(reserve(*pool, "c", 3, 1).status, NIXL_IN_PROG);
+    EXPECT_EQ(pool->waiterCount(), 2u);
+    ASSERT_EQ(begin(*pool, "a", 1, 1, held), NIXL_SUCCESS);
+    pool->finishRemoteLease(held.slotId, held.leaseId, NIXL_SUCCESS);
+    // The slot is free, but "c" is behind "b" in the queue.
+    nowUs_ += 1;
+    EXPECT_EQ(reserve(*pool, "c", 3, 1).status, NIXL_IN_PROG);
+    EXPECT_EQ(pool->fifoWaits(), 1u);
+    // A newcomer queues behind both.
+    EXPECT_EQ(reserve(*pool, "d", 4, 1).status, NIXL_IN_PROG);
+    EXPECT_EQ(pool->waiterCount(), 3u);
+    const auto b = reserve(*pool, "b", 2, 1);
+    EXPECT_EQ(b.status, NIXL_SUCCESS);
+    EXPECT_EQ(pool->waiterCount(), 2u);
+    ASSERT_EQ(begin(*pool, "b", 2, 1, b), NIXL_SUCCESS);
+    pool->finishRemoteLease(b.slotId, b.leaseId, NIXL_SUCCESS);
+    EXPECT_EQ(reserve(*pool, "d", 4, 1).status, NIXL_IN_PROG);
+    EXPECT_EQ(reserve(*pool, "c", 3, 1).status, NIXL_SUCCESS);
+    EXPECT_EQ(pool->waiterCount(), 1u);
+}
+
+TEST_F(StagedPoolTest, StaleWaiterIsPrunedFromQueueHead) {
+    auto pool = makePool(0, 1, /*lease_timeout_us=*/1000000, 0, /*waiter_timeout_us=*/50);
+    const auto held = reserve(*pool, "a", 1, 1);
+    ASSERT_EQ(held.status, NIXL_SUCCESS);
+    EXPECT_EQ(reserve(*pool, "b", 2, 1).status, NIXL_IN_PROG);
+    EXPECT_EQ(pool->waiterCount(), 1u);
+    ASSERT_EQ(begin(*pool, "a", 1, 1, held), NIXL_SUCCESS);
+    pool->finishRemoteLease(held.slotId, held.leaseId, NIXL_SUCCESS);
+    // "b" stopped polling; once its entry is stale a newcomer is served.
+    nowUs_ += 51;
+    EXPECT_EQ(reserve(*pool, "c", 3, 1).status, NIXL_SUCCESS);
+    EXPECT_EQ(pool->waiterCount(), 0u);
+}
+
+TEST_F(StagedPoolTest, QuotaBlockedRequesterDoesNotHoldQueueHead) {
+    auto pool = makePool(0, 2, /*lease_timeout_us=*/1000000, /*max_grants=*/1);
+    EXPECT_EQ(reserve(*pool, "a", 1, 1).status, NIXL_SUCCESS);
+    const auto b = reserve(*pool, "b", 2, 1);
+    ASSERT_EQ(b.status, NIXL_SUCCESS);
+    // Pool is full; "a" asks for a second slot: quota-blocked, not queued.
+    EXPECT_EQ(reserve(*pool, "a", 1, 2).status, NIXL_IN_PROG);
+    EXPECT_EQ(pool->waiterCount(), 0u);
+    EXPECT_EQ(reserve(*pool, "c", 3, 1).status, NIXL_IN_PROG);
+    EXPECT_EQ(pool->waiterCount(), 1u);
+    ASSERT_EQ(begin(*pool, "b", 2, 1, b), NIXL_SUCCESS);
+    pool->finishRemoteLease(b.slotId, b.leaseId, NIXL_SUCCESS);
+    // "a" is still over quota only while another agent holds a grant; "c" is
+    // the head waiter and gets the freed slot.
+    EXPECT_EQ(reserve(*pool, "a", 1, 2).status, NIXL_IN_PROG);
+    EXPECT_EQ(reserve(*pool, "c", 3, 1).status, NIXL_SUCCESS);
+}
+
+TEST_F(StagedPoolTest, SafeCancelledLeaseIsNotReplayed) {
+    auto pool = makePool(0, 2);
+    const auto grant = reserve(*pool, "peer", 1, 1);
+    ASSERT_EQ(grant.status, NIXL_SUCCESS);
+    EXPECT_TRUE(pool->cancelRemoteLease("peer", 1, 1, grant.slotId, grant.leaseId));
+    const auto fresh = reserve(*pool, "peer", 1, 1);
+    EXPECT_EQ(fresh.status, NIXL_SUCCESS);
+    EXPECT_NE(fresh.leaseId, grant.leaseId);
+    EXPECT_EQ(pool->grantReplays(), 0u);
 }
 
 } // namespace

@@ -41,3 +41,13 @@ if cuda_dep.found()
                dependencies: [cuda_dep, thread_dep],
                install: true)
 endif
+
+if cuda_dep.found()
+    staged_vram_write_smoke = executable('staged_vram_write_smoke',
+               'staged_vram_write_smoke.cpp',
+               cpp_args: ['-Wno-error=unused-variable', '-Wno-error=unused-function'],
+               dependencies: [nixl_dep, nixl_infra, nixl_common_deps, cuda_dep, thread_dep],
+               include_directories: [nixl_inc_dirs, utils_inc_dirs],
+               link_with: [serdes_lib],
+               install: true)
+endif

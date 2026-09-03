@@ -55,6 +55,14 @@ inline constexpr std::string_view nixl_ucx_staging_source_d2h_prefetch_param_nam
     "staging_source_d2h_prefetch";
 inline constexpr std::string_view nixl_ucx_staging_lease_timeout_param_name =
     "staging_lease_timeout_ms";
+inline constexpr std::string_view nixl_ucx_staging_grant_timeout_param_name =
+    "staging_grant_timeout_ms";
+inline constexpr std::string_view nixl_ucx_staging_ack_timeout_param_name =
+    "staging_ack_timeout_ms";
+inline constexpr std::string_view nixl_ucx_staging_max_attempts_param_name =
+    "staging_max_attempts";
+inline constexpr std::string_view nixl_ucx_staging_fifo_admission_param_name =
+    "staging_fifo_admission";
 inline constexpr std::string_view nixl_ucx_vram_local_staging_param_name = "vram_local_staging";
 inline constexpr std::string_view nixl_ucx_local_staging_shm_dir_param_name =
     "local_staging_shm_dir";
@@ -84,6 +92,18 @@ inline constexpr std::string_view nixl_ucx_staging_source_d2h_prefetch_env_name 
     "NIXL_UCX_STAGING_SOURCE_D2H_PREFETCH";
 inline constexpr std::string_view nixl_ucx_staging_lease_timeout_env_name =
     "NIXL_UCX_STAGING_LEASE_TIMEOUT_MS";
+inline constexpr std::string_view nixl_ucx_staging_grant_timeout_env_name =
+    "NIXL_UCX_STAGING_GRANT_TIMEOUT_MS";
+inline constexpr std::string_view nixl_ucx_staging_ack_timeout_env_name =
+    "NIXL_UCX_STAGING_ACK_TIMEOUT_MS";
+inline constexpr std::string_view nixl_ucx_staging_max_attempts_env_name =
+    "NIXL_UCX_STAGING_MAX_ATTEMPTS";
+inline constexpr std::string_view nixl_ucx_staging_fifo_admission_env_name =
+    "NIXL_UCX_STAGING_FIFO_ADMISSION";
+// Test-only fault injection, e.g. "drop_grant=0.01,drop_ack=0.01,drop_cancel_ack=0.01,
+// drop_slot_req=0.01,drop_ready=0.01": each named control message is silently dropped
+// with the given probability before it is sent.
+inline constexpr std::string_view nixl_ucx_staging_fault_env_name = "NIXL_UCX_STAGING_FAULT";
 inline constexpr std::string_view nixl_ucx_vram_local_staging_env_name =
     "NIXL_UCX_VRAM_LOCAL_STAGING";
 inline constexpr std::string_view nixl_ucx_local_staging_shm_dir_env_name =
