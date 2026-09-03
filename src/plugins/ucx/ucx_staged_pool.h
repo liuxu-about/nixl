@@ -49,6 +49,14 @@ struct nixlUcxStagedTxSlot {
     nixl_status_t status = NIXL_IN_PROG;
 };
 
+// Outcome of a retransmitted WRITE_READY, decided under one pool lock so it
+// cannot race finishRemoteLease.
+enum class nixlUcxStagedReadyRetry {
+    IN_PROGRESS,
+    COMPLETED,
+    UNKNOWN,
+};
+
 struct nixlUcxStagedReadyLease {
     void *hostAddr = nullptr;
     uint64_t slotId = 0;
@@ -104,6 +112,11 @@ public:
     [[nodiscard]] uint64_t
     txGeneration(size_t slot_id) const;
 
+    // grant_cycle identifies the initiator's current grant cycle for this
+    // (agent, transfer, chunk): a retransmit carries the same cycle and gets the
+    // same lease back; a request with a newer cycle means the initiator gave up
+    // on the earlier grant (SAFE_CANCEL may still be in flight), so a still
+    // reserved older lease is released and a fresh one granted.
     [[nodiscard]] nixlUcxStagedSlotGrant
     reserveRxSlot(const std::string &owner_agent,
                   uint64_t transfer_id,
@@ -111,7 +124,8 @@ public:
                   uint64_t region_token,
                   uintptr_t gpu_addr,
                   uint64_t gpu_dev,
-                  size_t size);
+                  size_t size,
+                  uint64_t grant_cycle = 0);
 
     [[nodiscard]] nixl_status_t
     beginRemoteH2D(const std::string &owner_agent,
@@ -153,6 +167,14 @@ public:
     // WRITE_READY idempotency: a lease that already finished H2D is remembered in
     // a small ring so a retransmitted READY can be answered with the same ACK
     // status instead of an error.
+    [[nodiscard]] nixlUcxStagedReadyRetry
+    classifyReadyRetry(const std::string &owner_agent,
+                       uint64_t transfer_id,
+                       uint64_t chunk_id,
+                       uint64_t slot_id,
+                       uint64_t lease_id,
+                       nixl_status_t &completed_status) const;
+
     [[nodiscard]] bool
     completedLeaseStatus(const std::string &owner_agent,
                          uint64_t transfer_id,
@@ -237,6 +259,7 @@ private:
         uint64_t gpuDev = 0;
         size_t size = 0;
         uint64_t grantedUs = 0;
+        uint64_t grantCycle = 0;
 
         void
         reset();
@@ -250,7 +273,8 @@ private:
                 uint64_t region_token,
                 uintptr_t gpu_addr,
                 uint64_t gpu_dev,
-                size_t size);
+                size_t size,
+                uint64_t grant_cycle);
 
     void
     decrementGrantCount(const std::string &owner_agent);

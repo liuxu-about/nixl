@@ -464,4 +464,51 @@ TEST_F(StagedPoolTest, SafeCancelledLeaseIsNotReplayed) {
     EXPECT_EQ(pool->grantReplays(), 0u);
 }
 
+TEST_F(StagedPoolTest, NewerGrantCycleReleasesAbandonedLeaseInsteadOfReplaying) {
+    auto pool = makePool(0, 2);
+    // Cycle 1 granted; the initiator abandons it (SAFE_CANCEL delayed) and asks
+    // again with cycle 2: the old lease must not come back.
+    const auto first = pool->reserveRxSlot("peer", 1, 1, 7, 0x1000, 0, kSlotSize, 1);
+    ASSERT_EQ(first.status, NIXL_SUCCESS);
+    const auto second = pool->reserveRxSlot("peer", 1, 1, 7, 0x1000, 0, kSlotSize, 2);
+    ASSERT_EQ(second.status, NIXL_SUCCESS);
+    EXPECT_NE(second.leaseId, first.leaseId);
+    EXPECT_EQ(pool->grantReplays(), 0u);
+    // The abandoned lease was released, so only one slot is in use.
+    EXPECT_EQ(reserve(*pool, "other", 9, 1).status, NIXL_SUCCESS);
+    EXPECT_EQ(reserve(*pool, "other", 9, 2).status, NIXL_IN_PROG);
+    // The late SAFE_CANCEL for the old lease no longer matches anything.
+    EXPECT_FALSE(pool->cancelRemoteLease("peer", 1, 1, first.slotId, first.leaseId));
+    // A retransmit of cycle 2 is still a replay.
+    const auto again = pool->reserveRxSlot("peer", 1, 1, 7, 0x1000, 0, kSlotSize, 2);
+    EXPECT_EQ(again.leaseId, second.leaseId);
+    EXPECT_EQ(pool->grantReplays(), 1u);
+}
+
+TEST_F(StagedPoolTest, StartedH2DLeaseIsReplayedEvenForNewerCycle) {
+    auto pool = makePool(0, 2);
+    const auto first = pool->reserveRxSlot("peer", 1, 1, 7, 0x1000, 0, kSlotSize, 1);
+    ASSERT_EQ(begin(*pool, "peer", 1, 1, first), NIXL_SUCCESS);
+    const auto again = pool->reserveRxSlot("peer", 1, 1, 7, 0x1000, 0, kSlotSize, 2);
+    EXPECT_EQ(again.status, NIXL_SUCCESS);
+    EXPECT_EQ(again.leaseId, first.leaseId);
+}
+
+TEST_F(StagedPoolTest, ReadyRetryClassificationIsAtomic) {
+    auto pool = makePool(0, 2);
+    nixl_status_t status = NIXL_IN_PROG;
+    const auto grant = reserve(*pool, "peer", 1, 1);
+    EXPECT_EQ(pool->classifyReadyRetry("peer", 1, 1, grant.slotId, grant.leaseId, status),
+              nixlUcxStagedReadyRetry::UNKNOWN);
+    ASSERT_EQ(begin(*pool, "peer", 1, 1, grant), NIXL_SUCCESS);
+    EXPECT_EQ(pool->classifyReadyRetry("peer", 1, 1, grant.slotId, grant.leaseId, status),
+              nixlUcxStagedReadyRetry::IN_PROGRESS);
+    pool->finishRemoteLease(grant.slotId, grant.leaseId, NIXL_ERR_BACKEND);
+    EXPECT_EQ(pool->classifyReadyRetry("peer", 1, 1, grant.slotId, grant.leaseId, status),
+              nixlUcxStagedReadyRetry::COMPLETED);
+    EXPECT_EQ(status, NIXL_ERR_BACKEND);
+    EXPECT_EQ(pool->classifyReadyRetry("peer", 1, 1, grant.slotId, grant.leaseId + 1, status),
+              nixlUcxStagedReadyRetry::UNKNOWN);
+}
+
 } // namespace

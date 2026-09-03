@@ -689,6 +689,8 @@ struct nixlUcxStagedChunk {
     // base for GRANT retransmits (slotReqPostedUs stays the stale-grant base).
     uint32_t grantAttempt = 0;
     uint32_t readyAttempt = 0;
+    // Incremented on every fresh SLOT_REQ (not on retransmits); see reserveRxSlot.
+    uint64_t grantCycle = 0;
     uint64_t lastSlotReqUs = 0;
     // True from SLOT_REQ send until the grant is consumed by the state machine.
     // A GRANT arriving while it is false is a duplicate or a late reply for a
@@ -3217,6 +3219,7 @@ nixlUcxEngine::sendStagedSlotReq(const std::string &remote_agent,
                                  uint64_t remote_gpu_dev,
                                  size_t size,
                                  uint32_t attempt,
+                                 uint64_t grant_cycle,
                                  const std::unique_ptr<nixlUcxEp> &ep,
                                  nixlUcxReq *req) const {
     if (stagedFaultDrop(stagedFault_.dropSlotReq, "SLOT_REQ")) {
@@ -3232,6 +3235,7 @@ nixlUcxEngine::sendStagedSlotReq(const std::string &remote_agent,
     ser_des.addBuf("gpu_dev", &remote_gpu_dev, sizeof(remote_gpu_dev));
     ser_des.addBuf("size", &size, sizeof(size));
     ser_des.addBuf("attempt", &attempt, sizeof(attempt));
+    ser_des.addBuf("grant_cycle", &grant_cycle, sizeof(grant_cycle));
 
     std::string *buffer = new std::string(ser_des.exportStr());
     auto deleter = [buffer, req](void *completed_request, void *ptr) {
@@ -3592,6 +3596,11 @@ nixlUcxEngine::handleStagedSlotReq(const nixl_blob_t &message, ucp_ep_h reply_ep
     uint64_t slot_id = 0;
     uint64_t lease_id = 0;
     uint64_t pool_epoch = 0;
+    uint64_t grant_cycle = 0;
+    // Optional: older initiators do not send it and get the replay-only rule.
+    if (ser_des.getBuf("grant_cycle", &grant_cycle, sizeof(grant_cycle)) != NIXL_SUCCESS) {
+        grant_cycle = 0;
+    }
     if (remote_agent.empty()) {
         status = NIXL_ERR_MISMATCH;
     }
@@ -3625,7 +3634,8 @@ nixlUcxEngine::handleStagedSlotReq(const nixl_blob_t &message, ucp_ep_h reply_ep
                                                 region_token,
                                                 gpu_addr,
                                                 gpu_dev,
-                                                size);
+                                                size,
+                                                grant_cycle);
                 status = grant.status;
                 slot_id = grant.slotId;
                 lease_id = grant.leaseId;
@@ -3760,6 +3770,12 @@ nixlUcxEngine::handleStagedSlotRelease(const nixl_blob_t &message, ucp_ep_h repl
     } else if (lease_in_progress) {
         result = kStagedCancelInProgress;
     }
+    // Only initiators that set UCP_AM_SEND_FLAG_REPLY on SLOT_RELEASE know the
+    // CANCEL_ACK message; an older peer would receive an active message it has
+    // no handler for. Its absence is the compatibility signal.
+    if (reply_ep == nullptr) {
+        return status;
+    }
     const nixl_status_t ack_status = sendStagedCancelAck(
         remote_agent, transfer_id, chunk_id, slot_id, lease_id, result, reply_ep);
     if (ack_status != NIXL_SUCCESS && ack_status != NIXL_IN_PROG) {
@@ -3831,8 +3847,9 @@ nixlUcxEngine::handleStagedWriteReady(const nixl_blob_t &message, ucp_ep_h reply
             // ACK it produced; if the copy is still in flight, the pending ACK will
             // answer both sends. Anything else is a real mismatch.
             nixl_status_t completed_status = NIXL_IN_PROG;
-            if (h2d_pool->completedLeaseStatus(
-                    remote_agent, transfer_id, chunk_id, slot_id, lease_id, completed_status)) {
+            const auto retry = h2d_pool->classifyReadyRetry(
+                remote_agent, transfer_id, chunk_id, slot_id, lease_id, completed_status);
+            if (retry == nixlUcxStagedReadyRetry::COMPLETED) {
                 stagedReadyReplays_.fetch_add(1, std::memory_order_relaxed);
                 NIXL_WARN << "Replaying UCX staged ACK for retransmitted WRITE_READY "
                           << "transfer_id=" << transfer_id << " chunk_id=" << chunk_id
@@ -3841,7 +3858,7 @@ nixlUcxEngine::handleStagedWriteReady(const nixl_blob_t &message, ucp_ep_h reply
                 return sendStagedAck(
                     remote_agent, transfer_id, chunk_id, lease_id, completed_status, reply_ep);
             }
-            if (h2d_pool->leaseInProgress(remote_agent, transfer_id, chunk_id, slot_id, lease_id)) {
+            if (retry == nixlUcxStagedReadyRetry::IN_PROGRESS) {
                 stagedReadyDuplicates_.fetch_add(1, std::memory_order_relaxed);
                 NIXL_WARN << "Ignoring duplicate UCX staged WRITE_READY with H2D in flight "
                           << "transfer_id=" << transfer_id << " chunk_id=" << chunk_id
@@ -4661,11 +4678,14 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
             return NIXL_ERR_NOT_FOUND;
         }
 
-        chunk.grantArrived.store(false);
-        chunk.grantStatus.store(NIXL_IN_PROG);
-        chunk.grantWanted.store(true);
         const uint64_t now_us = profileNowUs();
         if (!retry) {
+            // A retransmit must not touch the arrival markers: a GRANT that lands
+            // between the deadline check and this send would otherwise be wiped
+            // and its lease never released.
+            chunk.grantArrived.store(false);
+            chunk.grantStatus.store(NIXL_IN_PROG);
+            ++chunk.grantCycle;
             chunk.grantAttempt = 0;
             // Stamp before the send: grant_is_stale assumes this time precedes the
             // target's grant timestamp, which only holds if it is taken before the
@@ -4674,6 +4694,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
         } else {
             ++chunk.grantAttempt;
         }
+        chunk.grantWanted.store(true);
         chunk.lastSlotReqUs = now_us;
 
         nixlUcxReq req = nullptr;
@@ -4686,6 +4707,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                               chunk.remoteGpuDev,
                               chunk.size,
                               chunk.grantAttempt,
+                              chunk.grantCycle,
                               conn->getEp(staged_handle->getWorkerId()),
                               &req);
         const nixl_status_t append_status = chunk.req->append(send_status, req, conn);
@@ -5335,6 +5357,10 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                     if (!chunk.grantArrived.load()) {
                         // GRANT deadline: retransmit the SLOT_REQ (the target answers
                         // a repeated key with the same lease) until max_attempts.
+                        // Exhausting the budget fails the transfer with NIXL_ERR_CANCELED,
+                        // not NIXL_ERR_REMOTE_DISCONNECT: the agent layer treats the
+                        // latter as a dead peer and drops its metadata, which would cut
+                        // every later transfer to a target that merely stalled.
                         if (grant_timeout_us != 0 && chunk.lastSlotReqUs != 0 &&
                             profileNowUs() - chunk.lastSlotReqUs >= grant_timeout_us) {
                             if (chunk.grantAttempt + 1 >= max_attempts) {
@@ -5347,7 +5373,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                                            << " age_us="
                                            << (profileNowUs() - chunk.slotReqPostedUs);
                                 chunk.state = nixlUcxStagedChunk::State::FAILED;
-                                return fail(NIXL_ERR_REMOTE_DISCONNECT);
+                                return fail(NIXL_ERR_CANCELED);
                             }
                             ++staged_handle->profile.grantRetries;
                             NIXL_WARN << "[STAGED_GRANT_RETRY] resending SLOT_REQ transfer_id="
@@ -5472,7 +5498,7 @@ nixlUcxEngine::checkStagedXfer(nixlBackendReqH *handle) const {
                                            << " lease_id=" << chunk.leaseId.load()
                                            << " remote_agent=" << staged_handle->remoteAgent;
                                 chunk.state = nixlUcxStagedChunk::State::FAILED;
-                                return fail(NIXL_ERR_REMOTE_DISCONNECT);
+                                return fail(NIXL_ERR_CANCELED);
                             }
                             ++chunk.readyAttempt;
                             ++staged_handle->profile.readyRetries;

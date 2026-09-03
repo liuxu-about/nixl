@@ -245,7 +245,7 @@ protected:
         // Control-plane deadlines (0 disables). A SLOT_REQ without GRANT within
         // grantTimeoutMs, or a WRITE_READY without ACK within ackTimeoutMs, is
         // retransmitted; the target answers retransmits idempotently. After
-        // maxAttempts the chunk fails and the transfer reports an error.
+        // maxAttempts the chunk fails and the transfer reports NIXL_ERR_CANCELED.
         size_t grantTimeoutMs = 2000;
         size_t ackTimeoutMs = 5000;
         size_t maxAttempts = 5;
@@ -363,6 +363,7 @@ private:
                       uint64_t remote_gpu_dev,
                       size_t size,
                       uint32_t attempt,
+                      uint64_t grant_cycle,
                       const std::unique_ptr<nixlUcxEp> &ep,
                       nixlUcxReq *req) const;
 

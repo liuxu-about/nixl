@@ -43,6 +43,7 @@ nixlUcxStagedSlotPool::RxLease::reset() {
     gpuDev = 0;
     size = 0;
     grantedUs = 0;
+    grantCycle = 0;
 }
 
 nixlUcxStagedSlotPool::nixlUcxStagedSlotPool(uint64_t gpu_dev_id,
@@ -139,7 +140,8 @@ nixlUcxStagedSlotPool::grantRxSlot(size_t slot_id,
                                    uint64_t region_token,
                                    uintptr_t gpu_addr,
                                    uint64_t gpu_dev,
-                                   size_t size) {
+                                   size_t size,
+                                   uint64_t grant_cycle) {
     auto &lease = rxLeases_[slot_id];
     lease.reset();
     lease.state = nixlUcxStagedSlotState::REMOTE_RESERVED;
@@ -155,6 +157,7 @@ nixlUcxStagedSlotPool::grantRxSlot(size_t slot_id,
     lease.gpuDev = gpu_dev;
     lease.size = size;
     lease.grantedUs = nowUs_();
+    lease.grantCycle = grant_cycle;
     ++rxGrantsPerAgent_[owner_agent];
     return {.slotId = static_cast<uint64_t>(slot_id),
             .leaseId = lease.leaseId,
@@ -183,7 +186,8 @@ nixlUcxStagedSlotPool::reserveRxSlot(const std::string &owner_agent,
                                      uint64_t region_token,
                                      uintptr_t gpu_addr,
                                      uint64_t gpu_dev,
-                                     size_t size) {
+                                     size_t size,
+                                     uint64_t grant_cycle) {
     const std::lock_guard lock(mutex_);
     if (rxCount == 0) {
         return {.status = NIXL_ERR_NOT_SUPPORTED};
@@ -198,11 +202,20 @@ nixlUcxStagedSlotPool::reserveRxSlot(const std::string &owner_agent,
     // GRANT; handing out a second slot would leak the first one until the lease
     // timeout quarantines it.
     for (size_t i = 0; i < rxLeases_.size(); ++i) {
-        const auto &lease = rxLeases_[i];
+        auto &lease = rxLeases_[i];
         if ((lease.state == nixlUcxStagedSlotState::REMOTE_RESERVED ||
              lease.state == nixlUcxStagedSlotState::REMOTE_H2D) &&
             lease.ownerAgent == owner_agent && lease.transferId == transfer_id &&
             lease.chunkId == chunk_id) {
+            if (lease.state == nixlUcxStagedSlotState::REMOTE_RESERVED &&
+                grant_cycle > lease.grantCycle) {
+                // The initiator abandoned this grant (its SAFE_CANCEL may still be
+                // in flight or reordered behind this request). Release it here so
+                // the abandoned lease is never handed back.
+                decrementGrantCount(lease.ownerAgent);
+                lease.reset();
+                break;
+            }
             grantReplays_.fetch_add(1, std::memory_order_relaxed);
             const auto waiter = findWaiterLocked(owner_agent, transfer_id, chunk_id);
             if (waiter != waiters_.end()) {
@@ -269,8 +282,15 @@ nixlUcxStagedSlotPool::reserveRxSlot(const std::string &owner_agent,
     if (waiter != waiters_.end()) {
         waiters_.erase(waiter);
     }
-    return grantRxSlot(
-        free_slot, owner_agent, transfer_id, chunk_id, region_token, gpu_addr, gpu_dev, size);
+    return grantRxSlot(free_slot,
+                       owner_agent,
+                       transfer_id,
+                       chunk_id,
+                       region_token,
+                       gpu_addr,
+                       gpu_dev,
+                       size,
+                       grant_cycle);
 }
 
 nixl_status_t
@@ -590,4 +610,31 @@ size_t
 nixlUcxStagedSlotPool::waiterCount() const {
     const std::lock_guard lock(mutex_);
     return waiters_.size();
+}
+
+nixlUcxStagedReadyRetry
+nixlUcxStagedSlotPool::classifyReadyRetry(const std::string &owner_agent,
+                                          uint64_t transfer_id,
+                                          uint64_t chunk_id,
+                                          uint64_t slot_id,
+                                          uint64_t lease_id,
+                                          nixl_status_t &completed_status) const {
+    const std::lock_guard lock(mutex_);
+    if (slot_id < rxLeases_.size()) {
+        const auto &lease = rxLeases_[slot_id];
+        if (lease.state == nixlUcxStagedSlotState::REMOTE_H2D && lease.leaseId == lease_id &&
+            lease.transferId == transfer_id && lease.chunkId == chunk_id &&
+            lease.ownerAgent == owner_agent) {
+            return nixlUcxStagedReadyRetry::IN_PROGRESS;
+        }
+    }
+    for (const auto &entry : completed_) {
+        if (entry.leaseId == lease_id && entry.slotId == slot_id &&
+            entry.transferId == transfer_id && entry.chunkId == chunk_id &&
+            entry.ownerAgent == owner_agent) {
+            completed_status = entry.status;
+            return nixlUcxStagedReadyRetry::COMPLETED;
+        }
+    }
+    return nixlUcxStagedReadyRetry::UNKNOWN;
 }
