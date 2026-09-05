@@ -494,6 +494,61 @@ TEST_F(StagedPoolTest, StartedH2DLeaseIsReplayedEvenForNewerCycle) {
     EXPECT_EQ(again.leaseId, first.leaseId);
 }
 
+TEST_F(StagedPoolTest, WritableLeaseCountCoversReservedAndInFlightRanges) {
+    auto pool = makePool(1, 2, 10, 4);
+    EXPECT_EQ(pool->countWritableLeases(0x1000, kSlotSize, 0), 0u);
+
+    // reserve() grants [0x1000, 0x1000 + kSlotSize) on device 0.
+    const auto grant = reserve(*pool, "peer", 1, 1);
+    ASSERT_EQ(grant.status, NIXL_SUCCESS);
+    EXPECT_EQ(pool->countWritableLeases(0x1000, kSlotSize, 0), 1u);
+    EXPECT_EQ(pool->countWritableLeases(0x1000 + kSlotSize - 1, 1, 0), 1u);
+    EXPECT_EQ(pool->countWritableLeases(0x1000 - 8, 16, 0), 1u);
+    EXPECT_EQ(pool->countWritableLeases(0x1000 + kSlotSize, kSlotSize, 0), 0u);
+    EXPECT_EQ(pool->countWritableLeases(0x1000 - kSlotSize, kSlotSize, 0), 0u);
+    EXPECT_EQ(pool->countWritableLeases(0x1000, kSlotSize, 1), 0u);
+    EXPECT_EQ(pool->countWritableLeases(0x1000, 0, 0), 0u);
+
+    // A copy in flight still counts; only its completion clears the range.
+    ASSERT_EQ(begin(*pool, "peer", 1, 1, grant), NIXL_SUCCESS);
+    EXPECT_EQ(pool->countWritableLeases(0x1000, kSlotSize, 0), 1u);
+    pool->finishRemoteLease(grant.slotId, grant.leaseId, NIXL_SUCCESS);
+    EXPECT_EQ(pool->countWritableLeases(0x1000, kSlotSize, 0), 0u);
+}
+
+TEST_F(StagedPoolTest, CancelledQuarantinedAndFailedLeasesAreNotWritable) {
+    auto pool = makePool(1, 3, 10, 4);
+    const auto a = reserve(*pool, "peer", 1, 1);
+    const auto b = reserve(*pool, "peer", 1, 2);
+    const auto c = reserve(*pool, "peer", 1, 3);
+    ASSERT_EQ(a.status, NIXL_SUCCESS);
+    ASSERT_EQ(b.status, NIXL_SUCCESS);
+    ASSERT_EQ(c.status, NIXL_SUCCESS);
+    EXPECT_EQ(pool->countWritableLeases(0x1000, kSlotSize, 0), 3u);
+
+    ASSERT_TRUE(pool->cancelRemoteLease("peer", 1, 1, a.slotId, a.leaseId));
+    EXPECT_EQ(pool->countWritableLeases(0x1000, kSlotSize, 0), 2u);
+
+    ASSERT_TRUE(pool->quarantineRemoteLease("peer", 1, 2, b.slotId, b.leaseId));
+    EXPECT_EQ(pool->countWritableLeases(0x1000, kSlotSize, 0), 1u);
+
+    ASSERT_EQ(begin(*pool, "peer", 1, 3, c), NIXL_SUCCESS);
+    pool->finishRemoteLease(c.slotId, c.leaseId, NIXL_ERR_BACKEND);
+    EXPECT_EQ(pool->rxState(c.slotId), nixlUcxStagedSlotState::ERROR);
+    EXPECT_EQ(pool->countWritableLeases(0x1000, kSlotSize, 0), 0u);
+}
+
+TEST_F(StagedPoolTest, ExpiredLeaseStopsBeingWritableOnceQuarantined) {
+    auto pool = makePool(1, 2, 10, 4);
+    const auto grant = reserve(*pool, "peer", 1, 1);
+    ASSERT_EQ(grant.status, NIXL_SUCCESS);
+    EXPECT_EQ(pool->countWritableLeases(0x1000, kSlotSize, 0), 1u);
+    nowUs_ += 11;
+    EXPECT_EQ(pool->reclaimExpiredLeases(), 1u);
+    EXPECT_EQ(pool->rxState(grant.slotId), nixlUcxStagedSlotState::QUARANTINED);
+    EXPECT_EQ(pool->countWritableLeases(0x1000, kSlotSize, 0), 0u);
+}
+
 TEST_F(StagedPoolTest, ReadyRetryClassificationIsAtomic) {
     auto pool = makePool(0, 2);
     nixl_status_t status = NIXL_IN_PROG;

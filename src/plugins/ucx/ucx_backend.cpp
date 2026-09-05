@@ -2831,6 +2831,48 @@ nixl_status_t nixlUcxEngine::deregisterMem (nixlBackendMD* meta)
     return NIXL_SUCCESS;
 }
 
+nixl_status_t
+nixlUcxEngine::queryMem(const nixl_reg_dlist_t &descs,
+                        std::vector<nixl_query_resp_t> &resp) const {
+    // The staged transport's target-side write certificate. A decode that
+    // failed a request must not reuse its staging extent while a lease can
+    // still copy into it: the initiator giving up (ACK deadline, CANCELED)
+    // does not stop an H2D already queued here, and a SLOT_RELEASE that finds
+    // the lease in REMOTE_H2D only answers IN_PROGRESS. The local shared-memory
+    // path copies inside the AM handler without a lease, so its attachments
+    // are reported separately and the caller treats them as "no certificate".
+    size_t local_shared_attachments = 0;
+    {
+        const std::lock_guard lock(localSharedAttachMutex_);
+        local_shared_attachments = localSharedAttachments_.size();
+    }
+
+    resp.clear();
+    resp.reserve(descs.descCount());
+    for (int i = 0; i < descs.descCount(); ++i) {
+        const nixlBlobDesc &desc = descs[i];
+        size_t writable = 0;
+        if (descs.getType() == VRAM_SEG && vramStagingConfig_.enabled) {
+            nixlUcxStagedSlotPool *pool = nullptr;
+            {
+                const std::lock_guard lock(stagedPoolMutex_);
+                const auto it = stagedPools_.find(desc.devId);
+                if (it != stagedPools_.end()) {
+                    pool = it->second.get();
+                }
+            }
+            if (pool != nullptr) {
+                writable = pool->countWritableLeases(desc.addr, desc.len, desc.devId);
+            }
+        }
+        nixl_b_params_t info;
+        info["staged_writable_leases"] = std::to_string(writable);
+        info["staged_local_shared_attachments"] = std::to_string(local_shared_attachments);
+        resp.emplace_back(std::move(info));
+    }
+    return NIXL_SUCCESS;
+}
+
 nixl_status_t nixlUcxEngine::getPublicData (const nixlBackendMD* meta,
                                             std::string &str) const {
     if (const auto *staged = dynamic_cast<const nixlUcxStagedPrivateMetadata *>(meta)) {

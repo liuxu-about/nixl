@@ -17,6 +17,7 @@
 #include "ucx_staged_pool.h"
 
 #include <algorithm>
+#include <limits>
 #include <chrono>
 #include <utility>
 
@@ -456,6 +457,37 @@ nixlUcxStagedSlotPool::hasActiveWork() const {
            std::any_of(rxLeases_.begin(), rxLeases_.end(), [](const auto &lease) {
                return lease.state != nixlUcxStagedSlotState::FREE;
            });
+}
+
+size_t
+nixlUcxStagedSlotPool::countWritableLeases(uintptr_t gpu_addr,
+                                           size_t size,
+                                           uint64_t gpu_dev) const {
+    if (size == 0) {
+        return 0;
+    }
+    const uintptr_t range_end = size > std::numeric_limits<uintptr_t>::max() - gpu_addr ?
+        std::numeric_limits<uintptr_t>::max() :
+        gpu_addr + size;
+    const std::lock_guard lock(mutex_);
+    size_t count = 0;
+    for (const auto &lease : rxLeases_) {
+        if (lease.state != nixlUcxStagedSlotState::REMOTE_RESERVED &&
+            lease.state != nixlUcxStagedSlotState::REMOTE_H2D) {
+            continue;
+        }
+        if (lease.gpuDev != gpu_dev || lease.size == 0) {
+            continue;
+        }
+        const uintptr_t lease_end =
+            lease.size > std::numeric_limits<uintptr_t>::max() - lease.gpuAddr ?
+            std::numeric_limits<uintptr_t>::max() :
+            lease.gpuAddr + lease.size;
+        if (lease.gpuAddr < range_end && gpu_addr < lease_end) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 void *

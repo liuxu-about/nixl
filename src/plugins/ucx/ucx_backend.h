@@ -150,6 +150,13 @@ public:
     nixl_status_t
     deregisterMem(nixlBackendMD *meta) override;
 
+    // Per descriptor: "staged_writable_leases" = target slot leases that can
+    // still write into the range, "staged_local_shared_attachments" = live
+    // same-host shared-memory attachments (that path writes without a lease).
+    // A range is safe to hand to a new writer only when both are zero.
+    nixl_status_t
+    queryMem(const nixl_reg_dlist_t &descs, std::vector<nixl_query_resp_t> &resp) const override;
+
     nixl_status_t
     loadLocalMD(nixlBackendMD *input, nixlBackendMD *&output) override;
 

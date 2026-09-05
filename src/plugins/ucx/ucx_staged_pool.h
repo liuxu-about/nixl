@@ -217,6 +217,14 @@ public:
     [[nodiscard]] bool
     hasActiveWork() const;
 
+    // Leases that can still write into [gpu_addr, gpu_addr + size) on gpu_dev:
+    // REMOTE_RESERVED (a WRITE_READY may still arrive) and REMOTE_H2D (the copy
+    // is queued or in flight). QUARANTINED, ERROR and FREE leases never write.
+    // The application must not hand the range to a new writer while this is
+    // nonzero; nixlUcxEngine::queryMem exposes it per descriptor.
+    [[nodiscard]] size_t
+    countWritableLeases(uintptr_t gpu_addr, size_t size, uint64_t gpu_dev) const;
+
     [[nodiscard]] void *
     txHostAddr(size_t slot_id) const;
 
