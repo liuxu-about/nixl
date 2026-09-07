@@ -3639,8 +3639,13 @@ nixlUcxEngine::handleStagedSlotReq(const nixl_blob_t &message, ucp_ep_h reply_ep
     uint64_t lease_id = 0;
     uint64_t pool_epoch = 0;
     uint64_t grant_cycle = 0;
-    // Optional: older initiators do not send it and get the replay-only rule.
-    if (ser_des.getBuf("grant_cycle", &grant_cycle, sizeof(grant_cycle)) != NIXL_SUCCESS) {
+    // SLOT_REQ fields must be consumed in sendStagedSlotReq order. The
+    // diagnostic attempt precedes grant_cycle in the serialized stream.
+    uint32_t attempt = 0;
+    const auto attempt_status = ser_des.getBuf("attempt", &attempt, sizeof(attempt));
+    // Optional: older initiators do not send a cycle and use replay-only grants.
+    if (attempt_status != NIXL_SUCCESS ||
+        ser_des.getBuf("grant_cycle", &grant_cycle, sizeof(grant_cycle)) != NIXL_SUCCESS) {
         grant_cycle = 0;
     }
     if (remote_agent.empty()) {
